@@ -24,6 +24,7 @@ from .category_review_page import CategoryReviewPage
 from .todo_page import TodoPage
 from .category_fix_page import CategoryFixPage
 from .tag_review_page import TagReviewPage
+from .mini_window import MiniWindow
 from .product_page import ProductPage
 from .workers import (AnalysisWorker, BasicCollectWorker, DumpWorker,
                       FolderScanWorker, InspectWorker,
@@ -45,6 +46,14 @@ STATUS_COLORS = {
     "제외": QColor("#616161"),
     "미작업": QColor("#e65100"),
 }
+
+
+# 상단 탭에는 매일 쓰는 것만 둔다. 검토·수정용은 [검토중] 메뉴로 뺐다
+# (2026-09-05 사용자 요청). 인덱스는 stack 에 넣은 순서와 같아야 한다.
+NAV_TABS = ["대시보드", "상품정보", "미작업목록"]
+NAV_INDEX = {"대시보드": 0, "상품정보": 1, "미작업목록": 4}
+REVIEW_MENU = [("카테고리", 2), ("카테고리 검토", 3),
+               ("카테고리 수정", 5), ("태그 검수", 6)]
 
 
 class StatCard(QFrame):
@@ -211,6 +220,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        self._build_menubar()
         outer.addWidget(self._build_menu())
 
         self.stack = QStackedWidget()
@@ -262,6 +272,57 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         root.addWidget(self.progress)
 
+    def _build_menubar(self):
+        """
+        창 맨 위 메뉴줄. 파일 / 설정 / 검토중 / 종료.
+
+        검토·수정용 화면은 매일 쓰는 게 아니라 상단 탭에서 빼고 여기 넣었다.
+        탭은 대시보드·상품정보·미작업목록 셋만 남긴다.
+        """
+        mb = self.menuBar()
+
+        m = mb.addMenu("파일(&F)")
+        a = m.addAction("작업폴더 새로고침")
+        a.triggered.connect(self.on_scan_folders)
+        a = m.addAction("데이터 폴더 열기")
+        a.triggered.connect(self._open_data_dir)
+        m.addSeparator()
+        a = m.addAction("미니 모드로 전환	Ctrl+M")
+        a.setShortcut("Ctrl+M")
+        a.triggered.connect(self.to_mini)
+
+        m = mb.addMenu("설정(&S)")
+        a = m.addAction("접속 환경 점검")
+        a.triggered.connect(self._check_env)
+        a = m.addAction(".env 열기")
+        a.triggered.connect(self._open_env)
+
+        m = mb.addMenu("검토중(&R)")
+        for name, idx in REVIEW_MENU:
+            a = m.addAction(name)
+            a.triggered.connect(lambda _=False, i=idx: self._go_page(i))
+
+        m = mb.addMenu("종료(&X)")
+        a = m.addAction("프로그램 종료")
+        a.triggered.connect(self.close)
+
+    def _open_data_dir(self):
+        import subprocess
+        subprocess.Popen(["explorer", str(config.SQLITE_PATH.parent)])
+
+    def _open_env(self):
+        import subprocess
+        subprocess.Popen(["notepad", str(config.ROOT / ".env")])
+
+    def _check_env(self):
+        from ..lohas import datalab
+        msg = [f"위치       : {config.net_profile()}",
+               db.mysql_status(),
+               f"데이터랩   : {datalab.base() or '꺼짐'}",
+               f"SQLite     : {config.SQLITE_PATH}",
+               f"작업폴더   : {db.get_job_folder() or '(미지정)'}"]
+        QMessageBox.information(self, "접속 환경", chr(10).join(msg))
+
     def _build_menu(self) -> QWidget:
         """상단 메뉴 — 대시보드 / 상품정보 전환."""
         bar = QWidget()
@@ -278,20 +339,60 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for i, name in enumerate(
-                ["대시보드", "상품정보", "카테고리", "카테고리 검토",
-                 "미작업목록", "카테고리 수정", "태그 검수"]):
+                NAV_TABS):
             b = QPushButton(name)
             b.setCheckable(True)
             b.setChecked(i == 0)
             self.nav_group.addButton(b, i)
             lay.addWidget(b)
-        self.nav_group.idClicked.connect(self._go_page)
+        self.nav_group.idClicked.connect(
+            lambda i: self._go_page(NAV_INDEX[NAV_TABS[i]]))
 
         lay.addStretch(1)
+        btn_mini = QPushButton("🗕 미니")
+        btn_mini.setToolTip(
+            "오늘 작업량 · 저장완료 · ALL 상품분석만 남긴 작은 창으로 바꿉니다."
+            + chr(10) + "Ctrl+M 로도 됩니다. 작은 창의 「크게」로 돌아옵니다.")
+        btn_mini.setCheckable(False)
+        btn_mini.clicked.connect(self.to_mini)
+        lay.addWidget(btn_mini)
+
         self.lbl_nav_info = QLabel("")
         self.lbl_nav_info.setStyleSheet("color:#78909c; padding-right:10px;")
         lay.addWidget(self.lbl_nav_info)
         return bar
+
+    # ------------------------------------------------------------ 미니 모드
+
+    def to_mini(self):
+        """
+        작은 창으로 바꾼다. 큰 창은 닫지 않고 숨기기만 한다 —
+        자동점검·진행 중인 워커가 그대로 살아 있어야 하기 때문이다.
+        """
+        if getattr(self, "_mini", None) is None:
+            self._mini = MiniWindow(self)
+        self._mini.refresh()
+        # 큰 창이 있던 자리 오른쪽 위에 띄운다
+        g = self.geometry()
+        self._mini.move(g.x() + max(0, g.width() - self._mini.width() - 40),
+                        g.y() + 60)
+        self._mini.show()
+        self._mini.raise_()
+        self.hide()
+
+    def to_big(self):
+        """큰 창으로 돌아온다."""
+        if getattr(self, "_mini", None) is not None:
+            self._mini.hide()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _sync_mini(self):
+        """점검이 끝날 때마다 작은 창 숫자도 맞춘다."""
+        m = getattr(self, "_mini", None)
+        if m is not None and m.isVisible():
+            m.refresh()
 
     def _go_page(self, idx: int):
         self.stack.setCurrentIndex(idx)
@@ -1423,6 +1524,7 @@ class MainWindow(QMainWindow):
                 + (f" · 분석 {t['analyzed']:,}" if t["analyzed"] else ""))
         except Exception:
             self.card_today.set_value("-")
+        self._sync_mini()          # 작은 창을 띄워둔 채여도 숫자가 맞게
         if s_.get("capped"):
             self.lbl_capped.setText(
                 "⚠ 일부 상태조합이 조회 상한(1000행)에 걸렸습니다. "

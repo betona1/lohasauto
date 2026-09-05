@@ -871,3 +871,46 @@ class TagSaveWorker(BaseWorker):
             self.finished.emit(res)
         except Exception as e:
             self.failed.emit(f"{e}\n{traceback.format_exc()[:600]}")
+
+class StatusSyncWorker(BaseWorker):
+    """
+    상품정보 상태를 사이트 현재값으로 맞춘다.
+
+    미작업목록은 점검 당시의 스냅샷이라, 그 사이에 끝낸 것이 계속 미작업으로
+    남는다. 상태별로 한 번씩 검색해(각 1~2초) 실제 상태를 받아 DB 를 고친다.
+    검색 4번이면 되므로 12칸 전체 점검보다 훨씬 가볍다.
+    """
+
+    STATUSES = [("save", "저장완료"), ("none", "미작업"),
+                ("exclude", "제외"), ("hold", "보류")]
+
+    def __init__(self, folder_name: str = None):
+        super().__init__(False, 0, use_http=True)
+        self.folder_name = folder_name
+
+    def run(self):
+        try:
+            client = get_client(self.headless, self.monitor, log=self._log)
+            folder = self.folder_name or db.get_job_folder()
+            by_status = {}
+            for i, (val, name) in enumerate(self.STATUSES, 1):
+                if self.should_stop():
+                    self._log("사용자 중단")
+                    break
+                res = client.search(folder, dest_list="allow", dest_attr=val)
+                codes = {r[1] for r in res["rows"] if len(r) > 1}
+                by_status[name] = codes
+                self._log(f"  {name} {len(codes):,}행 ({res['elapsed']}초)")
+                self.progress.emit(i, len(self.STATUSES))
+
+            changed = db.sync_info_status(folder, by_status)
+            total = sum(changed.values())
+            if total:
+                self._log("상태 갱신 — " + " / ".join(
+                    f"{k} {v:,}건" for k, v in changed.items() if v))
+            else:
+                self._log("바뀐 것 없음 (이미 최신)")
+            self.finished.emit({"changed": changed, "total": total,
+                                "counts": {k: len(v) for k, v in by_status.items()}})
+        except Exception as e:
+            self.failed.emit(f"{e}\n{traceback.format_exc()[:600]}")

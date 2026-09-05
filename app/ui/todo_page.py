@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from .. import db
 from .. import config
 from .workers import (AnalysisWorker, CatKeywordWorker, DatalabWorker,
-                      TagAutoWorker)
+                      StatusSyncWorker, TagAutoWorker)
 
 SRC_LABEL = {"used": "지마켓 사용", "recommend": "추천", "token": "상품명",
              "wish": "희망검색어"}
@@ -41,6 +41,8 @@ STAGE_FILTERS = [
     ("카테고리 저장완료", "cat_done"),
     ("상품명·태그 미작업 ★", "tt_todo"),
     ("상품명·태그 진행중", "tt_part"),
+    ("이미 저장완료 (목록에서 빠질 것)", "saved"),
+    ("아직 안 끝난 것만", "unsaved"),
 ]
 
 # 컬럼별 정렬 기준. (키 함수, 처음 눌렀을 때 내림차순인가)
@@ -53,9 +55,11 @@ SORT_RULES = {
     3: (lambda g: (1 if g["analyzed"] else 0, -g["n"]), False),
     4: (lambda g: (g["cat_state"], -g["n"]), False),
     5: (lambda g: (g["tt_state"], -g["n"]), False),
-    6: (lambda g: (g["kw_tag"] + g["kw_title"], -g["n"]), False),
+    6: (lambda g: (g["saved"], -g["n"]), False),
+    7: (lambda g: (g["kw_tag"] + g["kw_title"], -g["n"]), False),
 }
-COLUMNS = ["LCP", "상품명", "L", "상품분석", "카테고리", "상품명·태그", "키워드"]
+COLUMNS = ["LCP", "상품명", "L", "상품분석", "카테고리", "상품명·태그",
+           "상품정보", "키워드"]
 
 
 class TodoPage(QWidget):
@@ -109,6 +113,16 @@ class TodoPage(QWidget):
         btn = QPushButton("새로고침")
         btn.clicked.connect(self.reload)
         top.addWidget(btn)
+
+        self.btn_sync = QPushButton("상태 동기화")
+        self.btn_sync.setToolTip(
+            "상품정보 상태를 사이트 현재값으로 맞춥니다 (검색 4번, 5초쯤)."
+            + chr(10)
+            + "상품명·태그를 저장하면 사이트가 '저장완료' 로 바꾸는데,"
+            + chr(10)
+            + "이 목록은 점검 당시 스냅샷이라 끝난 것이 계속 남아 있습니다.")
+        self.btn_sync.clicked.connect(self._sync_status)
+        top.addWidget(self.btn_sync)
 
         top.addStretch(1)
         self.btn_analysis = QPushButton("ALL 상품분석")
@@ -335,12 +349,16 @@ class TodoPage(QWidget):
             g = groups.setdefault(r["lcp_code"], {
                 "lcp_code": r["lcp_code"],
                 "product_name": r.get("product_name") or "",
-                "rows": [], "cat": "", "cat_saved": 0, "title_saved": 0})
+                "rows": [], "cat": "", "cat_saved": 0, "title_saved": 0,
+                "saved": 0})
             g["rows"].append(r)
             if r.get("etc_category"):
                 g["cat"] = str(r["etc_category"])
             g["cat_saved"] += 1 if r.get("cat_saved") else 0
             g["title_saved"] += 1 if r.get("title_saved") else 0
+            # 상품명·태그가 다 들어가면 사이트가 상품정보를 저장완료로 바꾼다.
+            # 목록은 점검 당시 스냅샷이라 그 전환이 안 보인다. 표시해준다.
+            g["saved"] += 1 if r.get("next_step") == "완료" else 0
         for g in groups.values():
             g["n"] = len(g["rows"])
             g["dl"] = have.get(g["cat"], {}).get("n", 0) if g["cat"] else 0
@@ -389,6 +407,10 @@ class TodoPage(QWidget):
             return g["cat_state"] == 2 and g["tt_state"] == 0
         if mode == "tt_part":
             return g["tt_state"] == 1
+        if mode == "saved":
+            return g["saved"] >= g["n"]
+        if mode == "unsaved":
+            return g["saved"] < g["n"]
         return True
 
     def _sort_by(self, col):
@@ -424,20 +446,23 @@ class TodoPage(QWidget):
             ana = "완료" if g["analyzed"] else "미분석"
             kw = (f"태그 {g['kw_tag']}/상품명 {g['kw_title']}"
                   if g["kw_tag"] or g["kw_title"] else "-")
+            sv = ("저장완료" if g["saved"] >= g["n"]
+                  else f"완료 {g['saved']}/{g['n']}" if g["saved"] else "미작업")
             vals = [g["lcp_code"], g["product_name"], str(g["n"]), ana, cat,
-                    tt, kw]
+                    tt, sv, kw]
             # 사이트와 같은 색 규칙 — 파란색 = 완료, 주황색 = 미작업
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(str(v))
-                if j in (3, 4, 5):
+                if j in (3, 4, 5, 6):
                     done = (g["analyzed"] if j == 3
                             else bool(g["cat"]) if j == 4
-                            else bool(g["title_saved"]))
+                            else bool(g["title_saved"]) if j == 5
+                            else g["saved"] >= g["n"])
                     it.setForeground(QColor(OK_COLOR if done else TODO_COLOR))
                     f = it.font()
                     f.setBold(True)
                     it.setFont(f)
-                if j == 6 and kw != "-":
+                if j == 7 and kw != "-":
                     it.setForeground(QColor("#2e7d32"))
                 self.tbl_lcp.setItem(i, j, it)
             self.tbl_lcp.item(i, 0).setData(Qt.UserRole, g["lcp_code"])
@@ -460,6 +485,7 @@ class TodoPage(QWidget):
         n_l = sum(g["n"] for g in rows)
         n_cat = sum(1 for g in rows if g["cat_state"] == 2)
         n_tt = sum(1 for g in rows if g["cat_state"] == 2 and g["tt_state"] == 0)
+        n_saved = sum(1 for g in rows if g["saved"] >= g["n"])
         n_dl = sum(1 for g in rows if g["dl"])
         cids = {g["cat"] for g in rows if g["cat"]}
         self.lbl_sum.setText(
@@ -469,6 +495,8 @@ class TodoPage(QWidget):
             f"<b style='color:{TODO_COLOR}'>{len(rows) - n_cat:,}</b>종"
             f" &nbsp;|&nbsp; 상품명·태그 대기 "
             f"<b style='color:{TODO_COLOR}'>{n_tt:,}</b>종"
+            f" &nbsp;|&nbsp; <b style='color:{OK_COLOR}'>이미 저장완료 "
+            f"{n_saved:,}</b>종"
             f" &nbsp;|&nbsp; 상품분석 완료 "
             f"<b style='color:{OK_COLOR}'>{sum(1 for g in rows if g['analyzed']):,}</b>종"
             f" &nbsp;|&nbsp; 카테고리 {len(cids):,}개 · 데이터랩 {n_dl:,}종"
@@ -716,6 +744,22 @@ class TodoPage(QWidget):
                   f"{st.get('already', 0):,} / 오류 {st.get('error', 0):,}")
         self.reload()
 
+    def _sync_status(self):
+        """상품정보 상태를 사이트 현재값으로 맞춘다."""
+        if self._thread:
+            return
+        self._log("상태 동기화 — 사이트에서 현재 상태를 읽습니다")
+        self._run(StatusSyncWorker(db.get_job_folder()), self._on_sync)
+
+    def _on_sync(self, res):
+        n = res.get("total", 0)
+        c = res.get("counts") or {}
+        self._log("사이트 현황 — " + " / ".join(
+            f"{k} {v:,}행" for k, v in c.items()))
+        if n:
+            self._log(f"DB {n:,}건을 사이트 상태로 맞췄습니다. 목록을 다시 읽습니다.")
+        self.reload()
+
     def _tag_auto(self):
         """
         키워드 자동추가. 선택한 LCP(Ctrl 이면 목록 전부)의 카테고리로
@@ -832,7 +876,8 @@ class TodoPage(QWidget):
         worker.finished.connect(lambda *_: self._done())
         worker.failed.connect(lambda *_: self._done())
         for b in (self.btn_dl_all, self.btn_dl_one, self.btn_analysis,
-                  self.btn_kw, self.btn_ck_one, self.btn_tag_auto):
+                  self.btn_kw, self.btn_ck_one, self.btn_tag_auto,
+                  self.btn_sync):
             b.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._thread.start()
@@ -844,7 +889,7 @@ class TodoPage(QWidget):
         self._thread = None
         self._worker = None
         for b in (self.btn_dl_all, self.btn_analysis, self.btn_kw,
-                  self.btn_tag_auto):
+                  self.btn_tag_auto, self.btn_sync):
             b.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.progress.setRange(0, 1)

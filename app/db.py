@@ -2494,3 +2494,35 @@ def tag_work_rows(folder_name: str = None, day: str = "",
                 break
     out.sort(key=lambda x: (x["lcp_code"], x["l_code"]))
     return out
+
+def sync_info_status(folder_name: str, by_status: dict) -> dict:
+    """
+    `lcp_lcode.info_status` 를 사이트 현재값으로 맞춘다.
+
+    상품명·태그를 저장하면 사이트가 상품정보를 '저장완료' 로 바꾼다
+    (2026-09-05 실측 — 202건이 그렇게 넘어갔다). 그런데 우리 목록은 점검
+    당시의 스냅샷이라, 동기화하지 않으면 이미 끝난 것이 계속 미작업으로
+    보인다.
+
+    by_status : {'저장완료': {L코드...}, '미작업': {...}, ...}
+    반환      : {상태: 바뀐 행수}
+    """
+    ts = now_str()
+    out = {}
+    with sqlite_conn() as conn:
+        for status, codes in (by_status or {}).items():
+            codes = [c for c in codes if c]
+            if not codes:
+                continue
+            n = 0
+            for i in range(0, len(codes), 500):
+                chunk = codes[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                cur = conn.execute(
+                    f"UPDATE lcp_lcode SET info_status = ?, updated_at = ? "
+                    f"WHERE folder_name = ? AND l_code IN ({marks}) "
+                    f"AND info_status != ?",
+                    [status, ts, folder_name, *chunk, status])
+                n += cur.rowcount
+            out[status] = n
+    return out

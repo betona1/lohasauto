@@ -25,7 +25,7 @@ from app.lohas import (attr_detail, session as ses,       # noqa: E402
                        tag_auto)
 
 
-def targets(lcp: str = "", todo_only: bool = True):
+def targets(lcp: str = "", todo_only: bool = True, only: set = None):
     """
     태그가 비어 있는 L코드를 LCP 단위로 묶는다. LCP 코드 오름차순이다.
 
@@ -49,7 +49,22 @@ def targets(lcp: str = "", todo_only: bool = True):
     groups = {}
     with db.sqlite_conn() as c:
         for r in c.execute(sql, args):
+            if only and r["lcp_code"] not in only:
+                continue
             groups.setdefault(r["lcp_code"], []).append(dict(r))
+    return groups
+
+
+def redo_targets(only: set):
+    """이미 태그가 있어도 다시 잡을 LCP (규칙이 바뀌었을 때 쓴다)."""
+    groups = {}
+    with db.sqlite_conn() as c:
+        for r in c.execute(
+                "SELECT lcp_code, l_code, product_no, etc_category, tag_count "
+                "FROM lcode_attr WHERE cat_saved = 1 "
+                "ORDER BY lcp_code, l_code"):
+            if r["lcp_code"] in only:
+                groups.setdefault(r["lcp_code"], []).append(dict(r))
     return groups
 
 
@@ -62,11 +77,22 @@ def main():
                     help="이미 태그가 있어도 덮어쓴다 (기본은 건너뜀)")
     ap.add_argument("--ai", action="store_true",
                     help="타사 브랜드·안 맞는 기능을 AI 가 걸러낸다")
+    ap.add_argument("--lcp-file", default="",
+                    help="한 줄에 하나씩 적힌 LCP 목록 파일만 처리")
+    ap.add_argument("--fill", action="store_true",
+                    help="태그가 5개 미만이면 상품명 후보로 채운다")
     ap.add_argument("--all", action="store_true",
                     help="미작업목록 범위를 넘어 카테고리 저장분 전부")
     args = ap.parse_args()
 
-    groups = targets(args.lcp, todo_only=not args.all)
+    only = None
+    if args.lcp_file:
+        only = {x.strip() for x in open(args.lcp_file, encoding="utf-8")
+                if x.strip()}
+    if only and args.overwrite:
+        groups = redo_targets(only)          # 이미 있는 것도 다시
+    else:
+        groups = targets(args.lcp, todo_only=not args.all, only=only)
     names = list(groups)
     if args.limit:
         names = names[:args.limit]
@@ -90,7 +116,7 @@ def main():
         try:
             res = tag_auto.apply_to_rows(
                 cli.session, rows, overwrite=args.overwrite,
-                use_ai=args.ai, log=lambda m: None)
+                use_ai=args.ai, fill_more=args.fill, log=lambda m: None)
         except Exception as e:
             fail += len(rows)
             print(f"[{i}/{len(names)}] {name} 실패: {str(e)[:70]}", flush=True)
