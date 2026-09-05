@@ -1,0 +1,28 @@
+# 비밀정보 — 절대 올리지 않는다 (.env.example 로 형식만 공유)
+.env
+data/cookies_*.json
+
+# 데이터·로그 (229MB SQLite, 수집 jsonl, 실행 로그)
+data/*
+!data/banned_words.txt
+logs/
+
+# 파이썬
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 편집기 · 도구
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# PyInstaller 빌드 산출물 (145MB)
+build/
+dist/
+*.manifest
+
+# 사내 작업 기록 — 서버 주소·실측 로그가 들어 있어 공개하지 않는다
+CLAUDE.md

@@ -1,0 +1,10 @@
+# 현재 전역 파이썬에 설치된 버전에서도 동작 확인됨
+# (PySide6 6.8.0 / selenium 4.35.0 / pymysql 1.4.6 / pyperclip 1.9.0)
+PySide6>=6.8.0
+requests>=2.31        # HTTP 직접조회 엔진의 핵심
+selenium>=4.35.0
+python-dotenv>=1.0.0
+PyMySQL>=1.1.0
+pyperclip>=1.9.0
+PyAutoGUI>=0.9.54
+paramiko>=3.4        # 외부망 SSH 터널
