@@ -417,3 +417,78 @@ def filter_tags(product_name: str, cands: list, brand: str = "",
         log("    [Gemini] 후보를 전부 빼라고 함 - 무시하고 규칙대로 진행")
         return {"drop": [], "ok": False}
     return {"drop": drop, "ok": True}
+
+def _prompt_title(product_name, brand, maker, cands):
+    lines = [f"{i + 1}. {c}" for i, c in enumerate(cands)]
+    return (
+        "쇼핑몰 상품명을 만들려고 한다. 쓸 키워드를 고른다."
+        + chr(10) + chr(10)
+        + f"상품명: {product_name}" + chr(10)
+        + f"브랜드: {brand or '-'} / 제조사: {maker or '-'}"
+        + chr(10) + chr(10)
+        + "아래 후보 중 **이 상품의 상품명에 넣어도 되는 것**의 번호를,"
+        + " 어울리는 순서대로 고른다."
+        + chr(10) + chr(10)
+        + "반드시 뺄 것" + chr(10)
+        + " - 다른 회사 브랜드·상표(위 상품명·브랜드·제조사에 없는 이름)"
+        + chr(10)
+        + " - 이 상품에 없는 품목·용도·재질·형태·규격" + chr(10)
+        + " - 이 상품이 아닌 다른 물건을 가리키는 말" + chr(10) + chr(10)
+        + chr(10).join(lines)
+        + chr(10) + chr(10)
+        + "answer 에는 **쓸 수 있는** 번호를 어울리는 순서대로,"
+        + " ban 에는 **절대 쓰면 안 되는**(다른 회사 브랜드·상표가 든) 번호를"
+        + " 적는다. 나머지는 어느 쪽에도 넣지 않는다." + chr(10)
+        + '형식: {"answer": "3,1,7", "ban": "5,9"}'
+    )
+
+
+def pick_title_keywords(product_name: str, cands: list, brand: str = "",
+                        maker: str = "", log=print) -> dict:
+    """
+    상품명에 쓸 키워드를 AI 가 골라 **어울리는 순서대로** 돌려준다.
+
+    상품명은 태그와 달리 조회수 큰 말을 써야 해서, 조회수 순으로만 뽑으면
+    '샤크 일렉트로룩스 차이슨' 같은 남의 브랜드가 앞자리를 차지한다
+    (2026-09-05 실측). 그래서 먼저 걸러낸다.
+
+    반환 {'pick': 쓸 것(어울리는 순), 'ban': 절대 쓰면 안 되는 것}
+    ban 은 남의 브랜드처럼 **예비로도 쓰면 안 되는** 것이다. 길이를 채우려고
+    예비를 꺼내 쓸 때 이것까지 들어가면 안 된다(2026-09-05 '대림세면대').
+    실패하면 빈 목록 — 호출 쪽이 규칙만으로 진행한다.
+    """
+    if not available() or not cands:
+        return {"pick": [], "ban": []}
+    body = {"contents": [{"parts": [{"text": _prompt_title(
+        product_name, brand, maker, cands)}]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512,
+                             "thinkingConfig": {"thinkingBudget": 0}}}
+    resp = _post(body, log=log)
+    if not resp:
+        return {"pick": [], "ban": []}
+    cand = (resp.get("candidates") or [{}])[0]
+    text = ""
+    for pt in (cand.get("content") or {}).get("parts") or []:
+        if isinstance(pt, dict) and pt.get("text"):
+            text = pt["text"]
+            break
+    if not text:
+        return {"pick": [], "ban": []}
+    import re as _re
+
+    def nums(part):
+        out, seen = [], set()
+        for tok in _re.findall(r"[0-9]+", part or ""):
+            i = int(tok) - 1
+            if 0 <= i < len(cands) and i not in seen:
+                seen.add(i)
+                out.append(cands[i])
+        return out
+
+    # answer / ban 을 갈라 읽는다. 형식이 깨지면 전체를 answer 로 본다.
+    m = _re.search(r'"answer"\s*:\s*"([^"]*)"', text)
+    b = _re.search(r'"ban"\s*:\s*"([^"]*)"', text)
+    if m or b:
+        return {"pick": nums(m.group(1) if m else ""),
+                "ban": nums(b.group(1) if b else "")}
+    return {"pick": nums(text), "ban": []}

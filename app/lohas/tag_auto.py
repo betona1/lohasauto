@@ -25,10 +25,13 @@
 사전으로는 '하츠'(사전엔 '바이하츠' 만 있다)를 못 잡고 '국산' 같은 일반어는
 오탐이 났다. 그 판단은 `gemini.filter_tags()` 에 맡긴다(선택).
 """
+import collections
 import re
 
 from .. import db
 from . import keywords, tabs
+
+_WORD_RE = re.compile(r"[0-9A-Za-z가-힣]+")
 
 MAX_TAGS = tabs.MAX_TAGS       # 사이트 상한 10
 LOW_VIEWS = 1000               # 로하스 지침 — 이 미만을 우선한다
@@ -86,6 +89,41 @@ def foreign_brand(name: str, own: str, vocab: set) -> str:
     return ""
 
 
+def common_words(names: list, ratio: float = 1.0) -> list:
+    """
+    그 LCP 상품명들에 **공통으로 들어간 낱말**. 그 물건이 무엇인지를 말한다.
+
+    배수구 트랩 9종의 상품명에 전부 '트랩' 이 있는데 상품명에서 빠지면
+    말이 안 된다(2026-09-06 사용자 지침). 이런 말은 될 수 있으면 넣는다.
+
+    `ratio` 는 몇 할의 상품명에 있어야 공통으로 볼지다(1.0 = 전부).
+    """
+    if not names:
+        return []
+    seen = collections.Counter()
+    for nm in names:
+        for w in set(_WORD_RE.findall(nm or "")):
+            if len(w) >= 2 and not w.isdigit():
+                seen[w] += 1
+    need = max(2, int(len(names) * ratio))
+    out = [w for w, n in seen.most_common() if n >= need]
+    # 긴 말을 앞에 둔다 - '배수구트랩' 이 '트랩' 보다 낫다
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def child_names(session, rows: list) -> list:
+    """그 LCP L코드들의 원상품명. 특성·같은종류 판정에 모두 쓴다."""
+    out = []
+    for r in rows:
+        try:
+            out.append(tabs.fetch_attr(
+                session, r["product_no"]).get("product_name", "") or "")
+        except Exception:
+            out.append("")
+    return out
+
+
 def own_words(lcp_code: str) -> str:
     """이 상품의 상품명·브랜드·제조사. 여기 들어간 이름은 통과시킨다."""
     with db.sqlite_conn() as c:
@@ -96,9 +134,218 @@ def own_words(lcp_code: str) -> str:
     return " ".join(x for x in (r["product_name"], r["brand"], r["maker"]) if x)
 
 
+def _same_onset(a: str, b: str) -> bool:
+    """두 한글 음절의 첫소리가 같은가. 저/져 는 같고, 함/포 는 다르다."""
+    def onset(ch):
+        n = ord(ch) - 0xAC00
+        return n // 588 if 0 <= n < 11172 else -1
+    oa, ob = onset(a), onset(b)
+    return oa >= 0 and oa == ob
+
+
+# 상품의 **특징**이 아니라 쓰는 사람·쓰는 곳·느낌을 말하는 말들.
+# 이런 것은 원상품명에 없어도 쓸 수 있다. 나머지 꾸밈말(지퍼·보냉·방수·색상
+# 처럼 그 상품에 실제로 있어야 하는 것)은 원상품명에 있어야 한다
+# (2026-09-06 사용자 지시: "해당상품의 특징 같은것은 상품명에 있어야만").
+ALLOW_MOD = {
+    "여성", "여자", "남성", "남자", "학생", "아이", "어린이", "유아", "성인",
+    "가정용", "업소용", "사무용", "사무실", "가정", "원룸", "자취", "혼자",
+    "인테리어", "휴대용", "다용도", "실내", "실외", "야외",
+    "예쁜", "이쁜", "귀여운", "감성", "데일리", "기본", "인기", "추천",
+    "선물", "답례품", "단체", "생활", "주방", "욕실", "화장실", "거실",
+}
+
+
+# 원단·형태 — 보통은 원상품명에 있어야 쓴다. 다만 **패션잡화처럼 원상품명이
+# 부실한 카테고리**에서는 이것까지 막으면 쓸 말이 남지 않는다. 그런 카테고리는
+# `cat_rule` 에 loose 로 등록해 이 목록만 풀어준다(2026-09-06 사용자 지시).
+SOFT_SPECS = {
+    "데님", "청지", "광목", "황마", "마직", "캔버스", "니트", "나일론",
+    "부직포", "코튼", "면", "린넨", "폴리", "모직", "스웨이드", "벨벳",
+    "메쉬", "매쉬", "타포린", "가죽", "인조가죽",
+    "접이식", "양면", "단면", "슬림", "와이드", "대형", "중형", "소형",
+    "미니", "특대", "손잡이", "지퍼", "포켓", "주머니",
+}
+
+
+def loosen(specs: set, loose: set) -> set:
+    """느슨한 카테고리에서는 원단·형태를 규격에서 뺀다. 수량·색상은 그대로."""
+    if not loose or "spec" not in loose:
+        return specs
+    return {x for x in specs if x not in SOFT_SPECS}
+
+
+def modifier_ok(name: str, base: str, common: list) -> bool:
+    """
+    후보에서 **품목 이름을 뺀 나머지(꾸밈말)** 가 원상품명에 있는가.
+
+        보냉에코백  -> '에코백' 은 이 LCP 품목  -> 꾸밈말 '보냉'
+        '보냉' 이 원상품명에 없으면 못 쓴다 - 보냉인지 알 수 없기 때문이다.
+
+    쓰는 사람·쓰는 곳을 말하는 꾸밈말(여성·업소용·인테리어)은 예외다.
+    품목 이름을 못 찾으면(공통 낱말이 없으면) 판정하지 않는다.
+    """
+    if not common:
+        return True
+    # 품목 이름을 아예 안 품은 후보는 '꾸밈말+품목' 꼴이 아니다. 다른 이름
+    # (강냉이의 '튀밥' 같은 딴이름)일 수 있으므로 여기서 판단하지 않는다.
+    # 이걸 빼먹어서 '튀밥' 이 특징 근거없음으로 잘렸다(2026-09-06).
+    if not any(w in name for w in common):
+        return True
+    rest = name
+    for w in sorted(common, key=len, reverse=True):
+        rest = rest.replace(w, " ")
+    b = (base or "")
+    for tok in _WORD_RE.findall(rest):
+        if len(tok) < 2:
+            continue
+        if tok in b or tok in ALLOW_MOD:
+            continue
+        if any(tok in w or w in tok for w in ALLOW_MOD):
+            continue
+        return False
+    return True
+
+
+def _is_cat_word(name: str, cat_name: str) -> bool:
+    """
+    카테고리 이름과 같은 말인가. 네이버는 이런 말을 태그로 받지 않는다.
+
+    마지막 칸이 '팝콘/강냉이류' 처럼 여러 말을 담고 있으면 조각도 본다 —
+    '팝콘'·'강냉이' 둘 다 안 들어가고 '튀밥' 만 들어갔다(2026-09-06 실측).
+    """
+    leaf = (cat_name or "").split("/")[-1].strip() if "/" not in cat_name         else cat_name
+    words = set()
+    for part in (cat_name or "").replace("/", " ").split():
+        p = part.strip()
+        if not p:
+            continue
+        words.add(p)
+        if p.endswith("류") and len(p) > 2:
+            words.add(p[:-1])
+    n = (name or "").strip()
+    return n in words
+
+
+_NUM_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+# '1+1' '2+1' 같은 **행사 표기**. 상품의 성질이 아니라 그때그때의 판촉이라
+# 상품명·태그에 넣지 않는다(2026-09-07 사용자: "숫자 1+1 이런건 넣치말고 빼줘").
+_PROMO_RE = re.compile(r"[0-9]+\s*\+\s*[0-9]+")
+
+
+def promo_ok(name: str) -> bool:
+    """행사 표기가 없으면 True. 있으면 쓰지 않는다."""
+    return not _PROMO_RE.search(name or "")
+
+
+def numbers_ok(name: str, base: str) -> bool:
+    """
+    후보에 박힌 **숫자**가 그 상품 이름에도 있는가.
+
+    '스위트콘340' 을 3.1Kg 짜리에 붙이면 안 된다. 340g 짜리에만 쓴다.
+    후보 목록은 조회수 순이라 그냥 첫 번째를 쓰면 남의 용량이 붙는다
+    (2026-09-06 사용자 지적: "숫자 들어간 검색 키워드는 주의해서 넣을 것").
+
+    '1+1' 같은 행사 표기는 **원상품명에 있어도** 넣지 않는다 - 판촉 문구지
+    상품의 성질이 아니다(2026-09-07 사용자 지적: 생강차 '라떼 1+1').
+    """
+    if not promo_ok(name):
+        return False
+    b = base or ""
+    for n in _NUM_RE.findall(name or ""):
+        if n not in b:
+            return False
+    return True
+
+
+def head_ok(name: str, own: str) -> bool:
+    """
+    후보의 **끝말(핵심 명사)** 이 그 LCP 상품명 어딘가에 있는가.
+
+    후보 표에는 같은 카테고리의 **다른 물건**이 섞여 온다. 물걸레 청소포
+    LCP 에 '대걸레탈수기' '마루왁스' '마루코팅제' 가 붙었다(2026-09-05).
+    청소포와 탈수기는 아예 다른 물건이라 검색이 잘못 걸린다.
+
+    끝에서 2~4글자 중 하나라도 그 LCP 상품명에 있으면 같은 종류로 본다.
+      대걸레탈수기 -> 수기/탈수기/레탈수기 : 없음 -> 뺀다
+      일회용청소포 -> 소포/청소포           : 있음 -> 쓴다
+      걸레티슈     -> 티슈                  : 있음(물티슈) -> 쓴다
+    상품명을 모르면(빈 문자열) 판단하지 않는다.
+    """
+    if not own:
+        return True
+    t = re.sub(r"[^0-9A-Za-z가-힣]", "", name)
+    o = re.sub(r"[^0-9A-Za-z가-힣]", "", own).upper()
+    if not t or not o:
+        return True
+    for k in (2, 3, 4):
+        if len(t) < k:
+            break
+        tail = t[-k:].upper()
+        if tail in o:
+            return True
+        # '도어클로져' 와 '도어클로저' 처럼 한 글자만 다른 표기도 같은 종류다.
+        # 단 **첫소리(초성)가 같을 때만** — 저/져 는 같은 말이지만
+        # 청소함/청소포 는 다른 물건이다(함 ㅎ, 포 ㅍ).
+        if k >= 3:
+            for i in range(len(o) - k + 1):
+                diff = [(a, b) for a, b in zip(tail, o[i:i + k]) if a != b]
+                if not diff:
+                    return True
+                if len(diff) == 1 and _same_onset(*diff[0]):
+                    return True
+
+    # 합성어 — 그 LCP 상품명의 낱말을 품고 있고, 끝 글자가 상품명 낱말의
+    # 끝 글자와 같으면 같은 종류로 본다.
+    #   일회용걸레포 : '걸레' 를 품고 끝이 '포'(청소포) -> 같은 종류
+    #   대걸레탈수기 : '걸레' 는 품었지만 '기' 로 끝나는 낱말이 없다 -> 아니다
+    words = [w for w in re.findall(r"[0-9A-Za-z가-힣]+", own or "")
+             if len(w) >= 2]
+    tu = t.upper()
+    share = any(w.upper()[i:i + 2] in tu
+                for w in words for i in range(len(w) - 1))
+    if share and any(w[-1] == t[-1] for w in words):
+        return True
+    return False
+
+
+def rules_for(cid) -> dict:
+    """
+    그 카테고리에 쌓인 사용자 지침. **태그도 상품명과 같은 규칙을 받는다.**
+
+    예전에는 `_pool` 이 `rules` 를 받을 수 있는데도 부르는 쪽에서 안 넘겨,
+    "카테고리별로 저장해 다음에 활용하라" 던 지침이 상품명에만 걸렸다
+    (2026-09-07 보이차 태그에 운남성·고수차·숙차가 그대로 남았다).
+    """
+    try:
+        from .. import db as _db
+
+        return _db.cat_rules(str(cid or ""), "tag")
+    except Exception:
+        return {"ban": set(), "need_name": set(), "must": [], "loose": set()}
+
+
+def cat_name_of(cid) -> str:
+    try:
+        from .. import db as _db
+
+        return _db.category_name(str(cid or "")) or ""
+    except Exception:
+        return ""
+
+
 def _pool(rows: list, exclude: set, own: str = "", vocab: set = None,
-          dropped: list = None) -> list:
-    """후보 행에서 쓸 수 있는 것만 남긴다."""
+          dropped: list = None, kin: str = None, common: list = None,
+          rules: dict = None, cat_name: str = "") -> list:
+    """
+    후보 행에서 쓸 수 있는 것만 남긴다.
+
+    `kin` 은 같은 종류인지 재는 기준 글(그 LCP 의 L코드 원상품명 전부).
+    아니라고 판정된 것은 버리지 않고 `kin=False` 로 표시해 **맨 뒤로 민다** —
+    쓸 게 없을 때까지 안 쓰지만, 태그 수가 모자라면 쓴다.
+    """
     out = []
     for r in rows:
         name = (r.get("name") or "").strip()
@@ -107,7 +354,31 @@ def _pool(rows: list, exclude: set, own: str = "", vocab: set = None,
         if r.get("banned"):                 # 금지어 열이 채워진 행
             continue
         if not usable_tag(name):    # 금지어 / 색상 · 갯수 / 규격 아닌 숫자
+            # 금지어라도 그 말이 이 LCP 상품명에 있으면 쓴다
+            if not ban_exempt(name, (kin if kin is not None else own) or ""):
+                continue
+        # 네이버는 **카테고리 이름 자체**를 태그로 안 받는다. 그래서 에코백
+        # 카테고리의 태그사전에 '에코백' 이 없고 오타 '애코백' 만 있었다
+        # (2026-09-06 사용자 확인).
+        if cat_name and _is_cat_word(name, cat_name):
             continue
+        base_txt = (kin if kin is not None else own) or ""
+        if not numbers_ok(name, base_txt):
+            if dropped is not None:
+                dropped.append(f"{name}(숫자 안 맞음)")
+            continue
+        # 그 상품에 실제로 있어야 하는 특징(지퍼·보냉·색상)은 원상품명에 있을 때만
+        if not modifier_ok(name, base_txt, common or []):
+            if dropped is not None:
+                dropped.append(f"{name}(특징 근거없음)")
+            continue
+        if rules:
+            if any(w in name and w not in base_txt
+                   for w in rules.get("need_name") or ()):
+                continue
+            if any(w in name and w not in own for w in rules.get("ban") or ()):
+                continue
+
         if vocab:
             b = foreign_brand(name, own, vocab)
             if b:
@@ -116,7 +387,12 @@ def _pool(rows: list, exclude: set, own: str = "", vocab: set = None,
                 continue
         out.append({"name": name,
                     "views": int(r.get("views") or 0),
-                    "prio": int(r.get("prio") or 0)})
+                    "prio": int(r.get("prio") or 0),
+                    # 이 LCP 와 같은 종류인가 (청소포 LCP 의 '마루왁스' = False).
+                    # 그 LCP 공통 낱말을 품었으면 표기만 다른 같은 물건이다 —
+                    # '점보롤통'·'점보롤카바' 를 걸러내면 안 된다(2026-09-06)
+                    "kin": (any(w in name for w in (common or []))
+                            or head_ok(name, kin if kin is not None else own))})
     return out
 
 
@@ -134,7 +410,9 @@ def _order(cands: list) -> list:
     high = [c for c in cands if c["views"] >= LOW_VIEWS]
 
     def key(c):
-        return (-(c["prio"] or 0), c["views"] or 0)
+        # 같은 종류 먼저 -> 태그사전+추천 먼저 -> 조회수 낮은 것 먼저
+        return (0 if c.get("kin", True) else 1,
+                -(c["prio"] or 0), c["views"] or 0)
 
     return sorted(low, key=key) + sorted(high, key=key)
 
@@ -193,7 +471,11 @@ def distribute(pool: list, n_targets: int, want: int = MAX_TAGS) -> list:
 #   100W 4회 · A4 4회 · 50M 2회 · 30M 2회 · 50W 1회
 _SPEC_RE = re.compile(
     r"(A[0-9]|B[0-9]|[0-9]{2,}X[0-9]{2,}"
-    # 갯수 단위(P·EA·매·입)는 규격이 아니라 수량이라 넣지 않는다.
+    # 수량(P·EA·매·입·개입)도 규격으로 본다. 넣지 않았더니 5P 짜리에
+    # '10개입' 이 붙고 한 상품명 안에 '5P 10개입' 이 같이 들어갔다
+    # (2026-09-05 LCP_LHA_B914790). 수량이 틀리면 반품 사유다.
+    r"|[0-9]+(?:개입|매입|장입|스틱|켤레|개|매|입|팩|봉|포|정|캔|병|롤"
+    r"|권|족|P|EA)(?![0-9])"
     # 단어경계(\b)를 붙이면 안 된다 - '100W투광등' 처럼 뒤에 한글이 오면
     # 한글도 단어문자라 경계가 생기지 않아 못 잡는다.
     r"|[0-9]+(?:\.[0-9]+)?(?:KW|W|CM|MM|ML|KG|M|L|G|인치|구|단)(?![0-9])"
@@ -204,10 +486,43 @@ _SPEC_RE = re.compile(
     # '사각' 이 목록에 없어서 원형 휴지통에 '사각휴지통' 이 붙었다(2026-09-05).
     r"|사각|정사각|직사각|원형|라운드|타원|삼각|육각|반원"
     r"|슬림|와이드|뚜껑|페달|스윙|오픈|밀폐|덮개|손잡이|바퀴"
-    r"|무선|유선|충전식|건전지|전동|수동"
+    r"|무선|유선|충전식|건전지|전동|수동|펌프|리필|거치대|받침대"
+    # 식품의 **제형** — 티백인지 가루인지는 상품마다 다르다. 티백 상품에
+    # '보이차분말' 태그가 붙었다(2026-09-07 사용자 지적). 원상품명에 있는
+    # 제형만 쓴다.
+    r"|티백|분말|가루|추출분말|스틱|액상|원액|과립|환|캡슐|타블렛"
+    r"|볶은|덖은|발효|건조|생차|숙차|잎차|고형"
+    # 고정이냐 이동이냐 — 한 상품명에 '고정식 ... 이동식' 이 같이 들어갔다
+    # (2026-09-06 L2104632). 상품명에 있는 쪽만 쓴다.
+    r"|고정식|이동식|이동형|고정형|무타공|타공|벽부착|자립형"
+    # 기능 — 상품명에 없으면 그 기능이 있는지 알 수 없다. LED 아닌 샤워기에
+    # 'LED샤워기' 가, 필터 없는 것에 '정수' 가 붙었다(2026-09-05 사용자 지적).
+    r"|LED|led|ONOFF|온오프|정수|필터|절수|마사지|무드등|온도계|자동잠금"
+    # 원산지·인증·효능 주장 — 상품명에 없으면 사실인지 알 수 없다.
+    # 중국산 샤워기에 '국내산' 이 붙었다(2026-09-05 사용자 지적).
+    # 색상 — 상품명에 없으면 그 색인지 알 수 없다.
+    r"|블랙|화이트|골드|실버|핑크|그레이|네이비|레드|블루|그린"
+    r"|베이지|브라운|아이보리|크롬|투톤|무광|유광"
+    # 설치 자리 — 다른 물건을 가리킨다. 욕실 샤워기에 '싱크대' 가 붙었다.
+    r"|싱크대|씽크대|세면대|욕조|변기|비데|현관문|방문"
+    r"|화장대|화장품|옷장|신발장|냉장고|서랍장|침대|베란다"
+    # 쓰는 곳이 특정 기관인 말. 옷걸이에 '교실' 은 어울리지 않는다
+    # (2026-09-06 사용자 지침). 상품명에 있을 때만 쓴다.
+    r"|교실|교사용|학교|유치원|어린이집|병원|기숙사|독서실"
+    # 목욕바구니를 헬스장에 들고 가지는 않는다(2026-09-06 사용자 지침)
+    r"|헬스장|헬스|체육관|수영장|찜질방|사우나|캠핑장"
+    r"|국내산|국산|수입산|정품|친환경|무독성|무형광|항균|방수|살균"
+    # 효능·등급 주장 — 상품명에 없으면 사실인지 알 수 없다.
+    # '자국 없는 고급' 이 아무 바지걸이에나 붙었다(2026-09-05 사용자 지적).
+    r"|자국|무자국|흠집|고급|프리미엄|명품|최고급|심플|모던|북유럽"
+    r"|거품|버블|연수|비타민|아로마"
     # 재질 — 상품명에 없으면 그 재질인지 알 수 없다. 유리·대리석·알루미늄이
     # 빠져 있어서 대리석 선반에 '강화유리일자선반' 이 붙었다(2026-09-05).
-    r"|스텐|스테인|스틸|우드|원목|실리콘|아크릴|고무|가죽|인조가죽"
+    r"|스텐|스테인|스틸|스탠|스덴|스뎅|우드|원목|실리콘|아크릴|고무|가죽|인조가죽"
+    # 원단 — '데님' 은 청바지 천이라 그 상품이 그 천이어야 쓴다
+    # (2026-09-06 사용자: "데님도 청바지의 뜻이니 안되고 데일리 같은 단어는 됨")
+    r"|데님|청지|광목|황마|마직|캔버스|니트|나일론|부직포|코튼|면|린넨|폴리"
+    r"|모직|스웨이드|벨벳|메쉬|매쉬|타포린"
     r"|강화유리|유리|인조대리석|대리석|알루미늄|세라믹|도자기|법랑|무쇠|주철"
     r"|황동|구리|주석|티타늄|플라스틱|PVC|ABS|PET|라탄|대나무|등나무"
     r"|패브릭|린넨|메탈|양은|타일|석재|한지|코르크)", re.I)
@@ -227,6 +542,9 @@ def words_of(text: str) -> set:
 _SYNONYM = {
     "스테인": "스텐", "스테인리스": "스텐", "스테인레스": "스텐",
     "스텐레스": "스텐", "스틸": "스텐", "메탈": "스텐",
+    # 후보 표에는 '스덴채반' 처럼 잘못 적힌 것도 그대로 온다. 사이트는
+    # 누르면 '스텐채반' 으로 고쳐 넣으므로 같은 재질로 봐야 한다(2026-09-05).
+    "스탠": "스텐", "스덴": "스텐", "스뎅": "스텐",
     "강화유리": "유리",
     "인조대리석": "대리석",
     "원목": "우드", "대나무": "우드", "등나무": "우드", "라탄": "우드",
@@ -242,6 +560,56 @@ _SYNONYM = {
 }
 
 
+_syn_cache = None
+
+
+def synonyms() -> dict:
+    """
+    표기 -> 대표어. 손으로 적은 것 위에 **로하스가 실제로 쓰는 대응**을 얹는다.
+
+    로하스는 키워드를 형태소로 쪼갤 때 표기를 대표어로 바꾼다 — '양면' 을
+    누르면 '리버시블' 이 들어간다. 그 대응을 상품명 탭에서 긁어 `synonym`
+    테이블에 쌓아뒀다(2026-09-05, 614쌍). 짐작으로 적은 목록보다 정확하다.
+    3회 이상 확인된 것만 쓴다 — 한 번뿐인 건 형태소 분석이 튄 것일 수 있다.
+    """
+    global _syn_cache
+    if _syn_cache is None:
+        m = dict(_SYNONYM)
+        try:
+            for surface, normal in db.synonym_map(min_seen=3).items():
+                a, b = surface.upper(), normal.upper()
+                # 규격 판정에 쓰는 말끼리의 대응만 받는다.
+                #   - 양쪽 다 _SPEC_RE 가 아는 말이어야 한다. '국산=국내산'
+                #     같은 건 규격이 아니라 넣어봐야 쓸 데가 없다
+                #   - 손으로 적은 것과 방향이 반대면 무시한다. 안 그러면
+                #     '스테인->스텐' 과 '스텐->스테인리스' 가 서로 밀어내
+                #     제자리로 돌아온다(2026-09-05 실측)
+                if not (_SPEC_RE.fullmatch(a) and _SPEC_RE.fullmatch(b)):
+                    continue
+                if m.get(b) == a or a in m.values():
+                    continue
+                m.setdefault(a, b)
+        except Exception:
+            pass                      # 사전이 없어도 손으로 적은 것으로 돈다
+        _syn_cache = m
+    return _syn_cache
+
+
+_QTY_RE = re.compile(r"^([0-9]+)(개입|매입|장입|스틱|켤레|개|매|입|팩|봉|포"
+                     r"|정|캔|병|롤|권|족|P|EA)$")
+
+
+def _qty(tok: str) -> str:
+    """
+    수량 표기를 하나로 모은다. 10P · 10개입 · 10EA 는 모두 같은 수량이다.
+
+    이렇게 모아두지 않으면 '10P 바지걸이' 에 '10개입' 이 다른 규격으로 보여
+    또 붙는다.
+    """
+    m = _QTY_RE.match(tok)
+    return f"{int(m.group(1))}개" if m else tok
+
+
 def specs_of(text: str) -> set:
     """
     상품명·키워드에서 규격·형태·재질을 뽑는다.
@@ -249,10 +617,18 @@ def specs_of(text: str) -> set:
     같은 뜻인데 표기만 다른 것은 대표어로 모은다. '스테인리스' 와 '스텐' 이
     다르게 잡히면 재질이 같은데도 태그를 못 붙인다.
     """
+    m = synonyms()
     out = set()
-    for m in _SPEC_RE.findall(text or ""):
-        u = m.upper()
-        out.add(_SYNONYM.get(u, u))
+    for x in _SPEC_RE.findall(text or ""):
+        u = _qty(x.upper())
+        seen = {u}
+        while True:                   # 스텐레스 -> 스테인리스 처럼 여러 단계
+            v = m.get(u)
+            if not v or v in seen:    # 순환하면 멈춘다
+                break
+            u = v
+            seen.add(u)
+        out.add(u)
     return out
 
 
@@ -290,6 +666,24 @@ def usable_tag(name: str) -> bool:
     if keywords.has_digit(n):
         return not keywords.has_digit(_SPEC_RE.sub("", n))
     return True
+
+
+def ban_exempt(name: str, own_text: str) -> bool:
+    """
+    금지어지만 **그 말이 원상품명에 있으면** 쓴다 (문서에 적힌 규칙).
+
+    '냉장고'·'세트' 가 금지어 사전에 들어 있어 '장난감냉장고'·'주방놀이세트'
+    가 통째로 막혔다. 핑크퐁 냉장고 상품에 '냉장고' 를 못 쓰면 손해다
+    (2026-09-06 LCP_LHA_B915352).
+    """
+    if not name or not own_text:
+        return False
+    for k in range(2, 7):
+        for i in range(0, len(name) - k + 1):
+            piece = name[i:i + k]
+            if keywords.has_banned(piece) and piece in own_text:
+                return True
+    return False
 
 
 def dyn_key(cand: str, names: list, pool: list = None) -> str:
@@ -394,21 +788,31 @@ def assign_by_names(ordered: list, names: list, want: int = MAX_TAGS) -> list:
     common, special = split_by_names(ordered, names)
     up = [(nm or "").upper() for nm in names]
 
+    # 규격이 박힌 것은 **하드 차단** — 안 맞으면 아무에게도 안 준다.
+    # 상품명에서 찾아낸 조각(key)은 **우선순위**로만 쓴다. 그것까지 차단하면
+    # '워시'·'용기'·'린스' 같은 평범한 말이 전부 특정 상품 전용이 되어,
+    # 그 말이 없는 상품은 태그를 몇 개 못 받는다(2026-09-05 LCP_LHA_B914696
+    # 에서 19개 후보 중 17개가 그렇게 잠겼다).
+    # 다른 물건으로 보이는 후보는 특성 배분에서도 뺀다. 맨 마지막 교차
+    # 배분에서만 쓴다 - '물걸레 리필' 에 '대걸레탈수기' 가 '걸레' 조각으로
+    # 걸려 들어왔다(2026-09-05).
+    special = ([c for c in special if c.get("kin", True)]
+               + [c for c in special if not c.get("kin", True)])
+    kin_sp = [c for c in special if c.get("kin", True)]
+    common = list(common) + [c for c in special if not c.get("kin", True)]
+    special = kin_sp
+    hard = [c for c in special if specs_of(c["name"])]
+    soft = [c for c in special if not specs_of(c["name"])]
+
     out = []
     for i in range(n):
-        mine = []
-        for c in special:
-            sp = specs_of(c["name"])
-            if sp:
-                # 태그에 박힌 규격이 **전부** 상품명에 있어야 한다.
-                # 하나만 겹쳐도 통과시키면 '휴지통20L' 이 2L 상품에 붙는다.
-                ok = sp <= specs_of(names[i])
-            else:
-                key = c.get("key") or ""
-                ok = bool(key) and key in up[i]
-            if ok:
-                mine.append(c)
+        mine = [c for c in hard if specs_of(c["name"]) <= specs_of(names[i])]
+        mine += [c for c in soft if (c.get("key") or "") in up[i]
+                 and c.get("key")]
         out.append(mine[:want])
+
+    # 남은 soft 는 모자란 상품에 돌아가며 준다 (차단이 아니라 후순위)
+    common = list(common) + [c for c in soft]
 
     # 공통은 상품명과 겹치는 것 먼저
     for i, sh in enumerate(out):
@@ -423,30 +827,39 @@ def assign_by_names(ordered: list, names: list, want: int = MAX_TAGS) -> list:
                 sh.append(c)
                 have.add(c["name"])
 
-    # 남은 공통은 돌아가며 (교차 배분)
-    pos = 0
-    for _ in range(len(common) * 2 + 2):
-        if all(len(sh) >= want for sh in out):
-            break
-        moved = False
-        for sh in out:
-            if len(sh) >= want or not common:
-                continue
-            have = {c["name"] for c in sh}
-            for j in range(len(common)):
-                c = common[(pos + j) % len(common)]
-                if c["name"] not in have:
-                    sh.append(c)
-                    pos = (pos + j + 1) % len(common)
-                    moved = True
-                    break
-        if not moved:
-            break
+    # 남은 공통은 돌아가며 (교차 배분).
+    # **같은 종류를 먼저 다 쓰고**, 그래도 모자랄 때만 다른 물건으로 보이는
+    # 후보를 쓴다. 물걸레 청소포 상품에 '마루왁스'·'대걸레탈수기' 가 붙어
+    # 사용자가 잡아냈다(2026-09-05). 형제와 태그가 겹치는 편이 낫다.
+    # 다른 물건으로 보이는 후보는 **아예 쓰지 않는다**. 10개를 채우려고
+    # 물걸레 청소포에 '마루왁스' 를 넣느니 9개로 두는 편이 낫다(절대규칙 4).
+    # 태그가 하나도 없는 상품에 한해 맨 아래에서 꺼내 쓴다.
+    kin_c = [c for c in common if c.get("kin", True)]
+    alien_c = [c for c in common if not c.get("kin", True)]
+    for bucket in (kin_c,):
+        pos = 0
+        for _ in range(len(bucket) * 2 + 2):
+            if all(len(sh) >= want for sh in out):
+                break
+            moved = False
+            for sh in out:
+                if len(sh) >= want or not bucket:
+                    continue
+                have = {c["name"] for c in sh}
+                for j in range(len(bucket)):
+                    c = bucket[(pos + j) % len(bucket)]
+                    if c["name"] not in have:
+                        sh.append(c)
+                        pos = (pos + j + 1) % len(bucket)
+                        moved = True
+                        break
+            if not moved:
+                break
 
     # 하나도 못 받은 상품은 공통에서라도 채운다 (태그 최소 1개)
     for sh in out:
         if not sh:
-            sh.extend((common or ordered)[:want])
+            sh.extend((kin_c or alien_c or ordered)[:want])
     return out
 
 
@@ -626,29 +1039,24 @@ def plan_rows(session, rows: list, *, want: int = MAX_TAGS,
     vocab = brand_vocab()
     drop_brand = []
 
+    plan_names = child_names(session, targets)
+    kin_text = own + " " + " ".join(plan_names)
+    common = common_words(plan_names)
     pool_all = _pool(tabs.fetch_tag_rows(session, head["product_no"]),
-                     set(), own, vocab, drop_brand)
+                     set(), own, vocab, drop_brand, kin=kin_text,
+                     common=common)
     pool = [c for c in pool_all if c["name"].upper() not in used]
     source = "태그"
     if len(pool) < MIN_SHARE and pool_all:      # 형제와 같은 태그를 쓴다
         pool = pool_all
     if not pool:
         pool = _pool(tabs.fetch_title_rows(session, head["product_no"], 1),
-                     used, own, vocab, drop_brand)
+                     used, own, vocab, drop_brand, kin=kin_text)
         source = "상품명"
         want = TITLE_FALLBACK
     if not pool:
         base["dropped_brand"] = drop_brand
         return base
-
-    # 상품별 원상품명을 먼저 읽는다 (특성 판정과 AI 분리에 둘 다 필요하다)
-    plan_names = []
-    for r in targets:
-        try:
-            plan_names.append(
-                tabs.fetch_attr(session, r["product_no"]).get("product_name", ""))
-        except Exception:
-            plan_names.append("")
 
     ordered = _order(pool)
     high = [c for c in ordered if c["views"] >= LOW_VIEWS]
@@ -683,6 +1091,234 @@ def plan_rows(session, rows: list, *, want: int = MAX_TAGS,
                  "dropped_brand": drop_brand, "dropped_ai": drop_ai,
                  "mode": "분배" if len(shares[0]) < len(ordered) else "동일"})
     return base
+
+
+def top_up_rows(session, rows: list, *, want: int = MAX_TAGS, log=print,
+                should_stop=None) -> dict:
+    """
+    이미 붙어 있는 태그는 그대로 두고 **모자란 만큼만 더 채운다**.
+
+    후보가 넉넉한 LCP 인데 어떤 L코드만 2~4개로 남는 일이 있다. 처음 나눌 때
+    형제가 먼저 가져간 탓이다. 그럴 때 부르는 것이고, 규칙은 그대로다 —
+    후보는 태그 표에서만, 조회수 1000 미만 먼저, 상품 특성이 맞아야 하고,
+    **형제가 덜 쓴 것부터** 준다(같은 LCP 가 넓게 걸리도록).
+    """
+    # 한 LCP 안에서도 L코드마다 카테고리가 다를 수 있다. 후보 표는
+    # 카테고리 기준으로 만들어지므로 **카테고리별로 나눠서** 처리한다.
+    # 안 나누면 공룡 카테고리 후보가 다리미·블록 상품에도 붙는다
+    # (2026-09-06 LCP_LHA_B915363 실측).
+    cids = {str(r.get("etc_category") or "") for r in rows}
+    if len(cids) > 1:
+        out = {"ok": 0, "fail": 0, "skip": 0, "added": 0,
+               "saved": [], "picks": {}}
+        for cid in sorted(cids):
+            part = [r for r in rows if str(r.get("etc_category") or "") == cid]
+            res = top_up_rows(session, part, want=want, log=log, should_stop=should_stop)
+            for k in ("ok", "fail", "skip", "added"):
+                out[k] = out.get(k, 0) + int(res.get(k) or 0)
+            out["saved"] += res.get("saved") or []
+            out["picks"].update(res.get("picks") or {})
+        return out
+
+    if not rows:
+        return {"ok": 0, "fail": 0, "skip": 0, "added": 0}
+
+    have = {}
+    for r in rows:
+        try:
+            have[r["l_code"]] = [t["text"] for t
+                                 in tabs.fetch_saved_tags(session, r["product_no"])]
+        except Exception as e:
+            have[r["l_code"]] = []
+            log(f"  !! {r['l_code']} 조회 실패 {str(e)[:50]}")
+
+    head = rows[0]
+    lcp = head.get("lcp_code") or ""
+    own = own_words(lcp)
+    vocab = brand_vocab()
+    drop_brand = []
+    names = child_names(session, rows)
+    common = common_words(names)
+    raw = tabs.fetch_tag_rows(session, head["product_no"])
+    _cid = head.get("etc_category") or ""
+    pool = _pool(raw, set(), own, vocab, drop_brand,
+                 kin=own + " " + " ".join(names), common=common,
+                 rules=rules_for(_cid), cat_name=cat_name_of(_cid))
+    if drop_brand:
+        log(f"  [태그] 타사 브랜드 제외 {len(drop_brand)}개: "
+            + ", ".join(drop_brand[:6]))
+    ordered = _order(pool)
+    alien = [c["name"] for c in ordered if not c.get("kin", True)]
+    if alien:
+        log(f"  [태그] 다른 물건으로 보이는 후보 {len(alien)}개는 맨 뒤로: "
+            + ", ".join(alien[:6]))
+    # 등록 불가 태그를 미리 걸러낸다. 저장 단계에서 빠지면 그 자리가 그냥
+    # 비어 9개로 끝난다 - '가화행거' 가 그렇게 빠졌다(2026-09-05).
+    try:
+        chk = tabs.tag_search(session, head["product_no"],
+                              [c["name"] for c in ordered])
+        bad = {t["text"].upper() for t in chk.get("restricted") or []}
+        if bad:
+            log(f"  [태그] 등록 불가 {len(bad)}개 제외: "
+                + ", ".join(sorted(bad)[:6]))
+            ordered = [c for c in ordered if c["name"].upper() not in bad]
+    except Exception as e:
+        log(f"  [태그] 사전 검증 건너뜀 ({str(e)[:40]})")
+    if not ordered:
+        log("  - 태그 후보가 없습니다")
+        return {"ok": 0, "fail": 0, "skip": len(rows), "added": 0}
+
+    # 형제들이 이미 몇 번 쓰고 있나 - 적게 쓰인 것부터 준다
+    used = collections.Counter()
+    for ts in have.values():
+        for t in ts:
+            used[t.upper()] += 1
+
+    plan = []
+    for i, r in enumerate(rows):
+        cur = list(have[r["l_code"]])
+        if len(cur) >= want:
+            continue
+        mine = names[i] or ""
+        my_specs = specs_of(mine)
+        got = {x.upper() for x in cur}
+        cands = sorted(ordered, key=lambda c: (used[c["name"].upper()],
+                                               ordered.index(c)))
+        # 1차는 엄격하게(특성이 맞는 것만), 그래도 모자라면 상품을 가르지 않는
+        # 공통 후보까지 쓴다. 규격(20L·A4 같은 것)은 어느 경우에도 안 푼다 —
+        # 틀린 규격이 붙으면 잘못된 검색에 걸린다(절대규칙 3).
+        for strict in (True, False):
+            for c in cands:
+                if len(cur) >= want:
+                    break
+                nm = c["name"]
+                if nm.upper() in got:
+                    continue
+                if not spec_ok(nm, my_specs):
+                    continue
+                if not c.get("kin", True) and cur:
+                    continue        # 다른 물건 - 채우려고 넣지 않는다
+                if strict:
+                    key = dyn_key(nm, names, ordered)
+                    if key and key not in mine:
+                        continue
+                cur.append(nm)
+                got.add(nm.upper())
+                used[nm.upper()] += 1
+            if len(cur) >= want:
+                break
+        if len(cur) > len(have[r["l_code"]]):
+            plan.append({**r, "proposed": cur, "source": "태그",
+                         "before": len(have[r["l_code"]])})
+
+    if not plan:
+        log("  - 더 넣을 태그가 없습니다")
+        return {"ok": 0, "fail": 0, "skip": len(rows), "added": 0}
+
+    added = sum(len(p["proposed"]) - p["before"] for p in plan)
+    log(f"  [태그보충] {len(plan)}건 / +{added}개")
+    res = save_plan(session, plan, log=log, should_stop=should_stop)
+    res["added"] = added
+    return res
+
+
+def fill_from_title(session, rows: list, *, want: int = MAX_TAGS,
+                    log=print, should_stop=None) -> dict:
+    """
+    **예외 경로** — 로하스 태그사전에 그 카테고리 키워드가 없을 때만 쓴다.
+
+    태그 후보 표가 비었거나 한두 개뿐이면 그 LCP 전체가 태그 1개로 끝난다.
+    그럴 때 상품명 후보에서 가져온다. 절대규칙 1을 어기는 것이므로
+    **사용자가 그렇게 하라고 할 때만** 부른다(2026-09-06 LCP_LHA_B914810,
+    카테고리 '패션잡화/여성가방/에코백' 은 태그사전이 비어 있었다).
+
+    고르는 기준은 태그와 같다 — 규격·수량·색상이 맞아야 하고, 같은 종류라야
+    하고, **그 상품 원상품명과 겹치는 것을 먼저** 준다.
+    """
+    # 한 LCP 안에서도 L코드마다 카테고리가 다를 수 있다. 후보 표는
+    # 카테고리 기준으로 만들어지므로 **카테고리별로 나눠서** 처리한다.
+    # 안 나누면 공룡 카테고리 후보가 다리미·블록 상품에도 붙는다
+    # (2026-09-06 LCP_LHA_B915363 실측).
+    cids = {str(r.get("etc_category") or "") for r in rows}
+    if len(cids) > 1:
+        out = {"ok": 0, "fail": 0, "skip": 0, "added": 0,
+               "saved": [], "picks": {}}
+        for cid in sorted(cids):
+            part = [r for r in rows if str(r.get("etc_category") or "") == cid]
+            res = fill_from_title(session, part, want=want, log=log, should_stop=should_stop)
+            for k in ("ok", "fail", "skip", "added"):
+                out[k] = out.get(k, 0) + int(res.get(k) or 0)
+            out["saved"] += res.get("saved") or []
+            out["picks"].update(res.get("picks") or {})
+        return out
+
+    if not rows:
+        return {"ok": 0, "fail": 0, "skip": 0, "added": 0}
+
+    lcp = rows[0].get("lcp_code") or ""
+    own = own_words(lcp)
+    vocab = brand_vocab()
+    names = child_names(session, rows)
+    common = common_words(names)
+    kin_text = own + " " + " ".join(names)
+
+    have = {}
+    for r in rows:
+        try:
+            have[r["l_code"]] = [t["text"] for t
+                                 in tabs.fetch_saved_tags(session, r["product_no"])]
+        except Exception:
+            have[r["l_code"]] = []
+
+    used = collections.Counter()
+    for ts in have.values():
+        for t in ts:
+            used[t.upper()] += 1
+
+    plan = []
+    for i, r in enumerate(rows):
+        if should_stop and should_stop():
+            break
+        cur = list(have[r["l_code"]])
+        if len(cur) >= want:
+            continue
+        mine = names[i] or ""
+        my_specs = specs_of(mine)
+        my_words = words_of(mine)
+        drop = []
+        pool = _pool(tabs.fetch_title_rows(session, r["product_no"], 1),
+                     set(), own, vocab, drop, kin=kin_text, common=common)
+        if not pool:
+            continue
+        # 그 상품 상품명과 겹치는 것 먼저, 그다음 형제가 덜 쓴 것 먼저
+        pool.sort(key=lambda c: (-len(words_of(c["name"]) & my_words),
+                                 used[c["name"].upper()],
+                                 0 if c.get("kin", True) else 1,
+                                 c["views"]))
+        got = {x.upper() for x in cur}
+        for c in pool:
+            if len(cur) >= want:
+                break
+            nm = c["name"]
+            if nm.upper() in got or not spec_ok(nm, my_specs):
+                continue
+            if not c.get("kin", True):
+                continue
+            cur.append(nm)
+            got.add(nm.upper())
+            used[nm.upper()] += 1
+        if len(cur) > len(have[r["l_code"]]):
+            plan.append({**r, "proposed": cur, "source": "상품명",
+                         "before": len(have[r["l_code"]])})
+
+    if not plan:
+        log("  - 상품명 후보에서도 넣을 것이 없습니다")
+        return {"ok": 0, "fail": 0, "skip": len(rows), "added": 0}
+    added = sum(len(p["proposed"]) - p["before"] for p in plan)
+    log(f"  [태그·상품명후보] {len(plan)}건 / +{added}개")
+    res = save_plan(session, plan, log=log, should_stop=should_stop)
+    res["added"] = added
+    return res
 
 
 def save_plan(session, plan_rows_: list, *, log=print, should_stop=None,
@@ -741,6 +1377,26 @@ def apply_to_rows(session, rows: list, *, want: int = MAX_TAGS,
     같은 상품이라 후보 표가 같다. 사람이 이미 달아둔 태그는 후보에서 빼고
     남은 것을 빈 L코드들에 나눠 준다.
     """
+    # 한 LCP 안에서도 L코드마다 카테고리가 다를 수 있다. 후보 표는
+    # 카테고리 기준으로 만들어지므로 **카테고리별로 나눠서** 처리한다.
+    # 안 나누면 공룡 카테고리 후보가 다리미·블록 상품에도 붙는다
+    # (2026-09-06 LCP_LHA_B915363 실측).
+    cids = {str(r.get("etc_category") or "") for r in rows}
+    if len(cids) > 1:
+        out = {"ok": 0, "fail": 0, "skip": 0, "added": 0,
+               "saved": [], "picks": {}}
+        for cid in sorted(cids):
+            part = [r for r in rows if str(r.get("etc_category") or "") == cid]
+            res = apply_to_rows(session, part, want=want, overwrite=overwrite, use_ai=use_ai,
+                             fill_more=fill_more, fill_to=fill_to,
+                             log=log, should_stop=should_stop,
+                             progress=progress)
+            for k in ("ok", "fail", "skip", "added"):
+                out[k] = out.get(k, 0) + int(res.get(k) or 0)
+            out["saved"] += res.get("saved") or []
+            out["picks"].update(res.get("picks") or {})
+        return out
+
     ok = fail = skip = 0
     saved, picks = [], {}
 
@@ -771,8 +1427,15 @@ def apply_to_rows(session, rows: list, *, want: int = MAX_TAGS,
     vocab = brand_vocab()
     drop_brand = []
 
+    names = child_names(session, targets)
+    kin_text = own + " " + " ".join(names)
+    common = common_words(names)
     raw = tabs.fetch_tag_rows(session, head["product_no"])
-    pool_all = _pool(raw, set(), own, vocab, drop_brand)   # 형제가 쓰는 것 포함
+    _cid = head.get("etc_category") or ""
+    _rules, _cname = rules_for(_cid), cat_name_of(_cid)
+    pool_all = _pool(raw, set(), own, vocab, drop_brand,   # 형제가 쓰는 것 포함
+                     kin=kin_text, common=common,
+                     rules=_rules, cat_name=_cname)
     pool = [c for c in pool_all if c["name"].upper() not in used]
     source = "태그"
     if drop_brand:
@@ -787,27 +1450,21 @@ def apply_to_rows(session, rows: list, *, want: int = MAX_TAGS,
         if not pool:
             log(f"  [태그] 새 후보 없음 - 형제와 같은 태그를 씁니다")
         pool = pool_all
-    if not pool:
-        # 태그 후보 표 자체가 비었을 때만 상품명에서 1개를 가져온다.
+    if len(pool_all) < MIN_SHARE:
+        # 로하스 태그사전에 그 카테고리 키워드가 아예 없는 경우가 있다.
+        # 패션잡화가 그렇다 - '에코백' 카테고리는 후보가 1개(그것도 오타)뿐이라
+        # 그 LCP 14종이 전부 태그 1개로 끝났다(2026-09-06 사용자 확인).
+        # 이럴 때는 어쩔 수 없이 상품명 후보에서 10개까지 가져온다.
         pool = _pool(tabs.fetch_title_rows(session, head["product_no"], 1),
-                     used, own, vocab, drop_brand)
+                     used, own, vocab, drop_brand, kin=kin_text,
+                     common=common, rules=_rules, cat_name=_cname)
         source = "상품명"
-        want = TITLE_FALLBACK
-        log(f"  [태그] 태그 후보 표가 비었습니다 - 상품명에서 "
-            f"{TITLE_FALLBACK}개만 씁니다")
+        log(f"  [태그] 태그 후보가 {len(pool_all)}개뿐 - 상품명 후보에서 "
+            f"{want}개까지 씁니다")
     if not pool:
         log("  - 넣을 태그가 없습니다")
         return {"ok": 0, "fail": 0, "skip": skip + len(targets),
                 "saved": [], "picks": {}}
-
-    # 상품마다 규격·형태가 다르다. 각자의 원상품명을 먼저 읽는다.
-    names = []
-    for r in targets:
-        try:
-            names.append(
-                tabs.fetch_attr(session, r["product_no"]).get("product_name", ""))
-        except Exception:
-            names.append("")
 
     ordered = _order(pool)
     if use_ai and source == "태그":
@@ -821,8 +1478,13 @@ def apply_to_rows(session, rows: list, *, want: int = MAX_TAGS,
         kept = ai_filter(lcp, common0, log=log) if common0 else []
         ordered = _order(kept + special0)
 
+    # 조회수 1000 미만 우선은 **권고**다. 하드 컷이 아니다 — 모자라면 그
+    # 이상으로 채워 개수를 맞춘다(로하스 지침 5번, CLAUDE.md 4-5).
+    # 잘라내고 있어서 보이차 LCP 에서 가장 일반적인 '중국보이차'(1670)가
+    # 통째로 빠지고 조회수 0짜리 '보이차분' 만 남았다(2026-09-07 사용자 지적).
+    # `_order` 가 이미 1000 이상을 뒤로 보내므로 순서만 지키면 된다.
     high = [c for c in ordered if c["views"] >= LOW_VIEWS]
-    ordered = low_only(ordered)          # 1000 이상은 쓰지 않는다
+    ordered = low_only(ordered) + high
     common, special = split_by_names(ordered, names)
     if special:
         shares = assign_by_names(ordered, names, want)

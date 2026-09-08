@@ -23,13 +23,20 @@ from ..lohas.session import get_client
 class MonitorWorker(QObject):
     log = Signal(str)
     tick = Signal(dict)        # 주기마다 현황 전달
+    ai_done = Signal(dict)     # 걸어둔 AI 이미지 작업이 끝났다
     failed = Signal(str)
     finished = Signal(dict)
 
-    def __init__(self, folder_name: str, interval: int = 30,
+    def __init__(self, folder_name, interval: int = 30,
                  headless: bool = False, monitor: int = 0):
         super().__init__()
-        self.folder_name = folder_name
+        # 폴더를 여럿 받으면 주기마다 **번갈아** 점검한다. 한 주기에 다 돌면
+        # 폴더 수만큼 느려지므로 하나씩 돌아가며 본다(2026-09-06 사용자 요청).
+        self.folders = ([folder_name] if isinstance(folder_name, str)
+                        else [f for f in (folder_name or []) if f])
+        self.folder_name = self.folders[0] if self.folders else ""
+        self._turn = 0
+        self._prev_by = {}
         self.interval = max(int(interval), 5)
         self.headless = headless
         self.monitor = monitor
@@ -38,6 +45,8 @@ class MonitorWorker(QObject):
         self._prev = None
         self._last_rate_log = 0.0
         self.rate_log_every = 300      # 속도 로그 기록 간격(초)
+        self._ai_state = None          # 마지막으로 본 AI 작업 상태
+        self._ai_last_poll = 0.0       # 대신 긁어본 시각(대타로 볼 때만)
 
     def stop(self):
         self._stop = True
@@ -63,7 +72,13 @@ class MonitorWorker(QObject):
     def run(self):
         try:
             client = get_client(self.headless, self.monitor, log=self._log)
-            self._log(f"[모니터] '{self.folder_name}' {self.interval}초 주기 점검 시작")
+            if len(self.folders) > 1:
+                self._log(f"[모니터] 폴더 {len(self.folders)}개를 번갈아 점검합니다"
+                          f" ({self.interval}초 주기) — "
+                          + " / ".join(self.folders))
+            else:
+                self._log(f"[모니터] '{self.folder_name}' {self.interval}초"
+                          " 주기 점검 시작")
 
             # 껐다 켠 사이의 작업량이 누락되지 않도록 마지막 기록을 기준점으로
             prev_row = db.last_work_log(self.folder_name)
@@ -81,6 +96,14 @@ class MonitorWorker(QObject):
 
             while not self._stop:
                 started = time.time()
+                if len(self.folders) > 1:
+                    # 이번 차례 폴더로 바꾼다. 폴더마다 직전값을 따로 둔다 —
+                    # 섞으면 증감이 엉뚱하게 나온다.
+                    self._prev_by[self.folder_name] = self._prev
+                    self.folder_name = self.folders[
+                        self._turn % len(self.folders)]
+                    self._turn += 1
+                    self._prev = self._prev_by.get(self.folder_name)
                 try:
                     snap = self._one_cycle(client)
                 except Exception as e:
@@ -190,6 +213,9 @@ class MonitorWorker(QObject):
                                 f"상품정보완료 {snap['d_info_save']:+} / "
                                 f"분석 {snap['d_analyzed']:+}")
 
+                # 걸어둔 AI 이미지 작업이 끝났는지 본다
+                self._check_ai(client)
+
                 # 남은 시간만큼 잘게 나눠 대기 (중단 반응성 확보)
                 wait = self.interval - (time.time() - started)
                 while wait > 0 and not self._stop:
@@ -203,6 +229,60 @@ class MonitorWorker(QObject):
             self.failed.emit(str(e))
 
     # ------------------------------------------------------------------
+
+    # AI 이미지 작업 확인 --------------------------------------------------
+    # **예약된 작업이 있을 때만** 본다. 없으면 아무것도 하지 않는다
+    # (2026-09-07 사용자: "예약작업 걸었을때만 자동점검에서 점검해야함").
+    AI_STALE_SEC = 600        # 기록이 이만큼 안 바뀌면 대신 긁어본다
+    AI_POLL_SEC = 300         # 대타로 볼 때의 최소 간격
+    AI_END = ("완료", "취소완료", "실패", "오류")
+
+    def _check_ai(self, client):
+        """
+        걸어둔 AI 이미지 작업이 끝났으면 알린다.
+
+        평소엔 **DB 기록만 읽는다** — 작업을 건 워커가 폴링하며 적어두므로
+        같은 화면을 두 곳에서 긁을 이유가 없다. 워커가 죽었거나 프로그램을
+        다시 켠 경우(기록이 10분 넘게 안 바뀜)에만 대신 한 번 긁어본다.
+        """
+        rec = db.ai_job_get()
+        if not rec:
+            self._ai_state = None
+            return
+
+        state = rec.get("state") or ""
+        stale = False
+        try:
+            from datetime import datetime
+            t = datetime.strptime(rec.get("updated_at", ""), "%Y-%m-%d %H:%M:%S")
+            stale = (datetime.now() - t).total_seconds() > self.AI_STALE_SEC
+        except Exception:
+            stale = True
+
+        if stale and time.time() - self._ai_last_poll > self.AI_POLL_SEC:
+            # 기록이 멈췄다 - 이때만 직접 확인한다
+            self._ai_last_poll = time.time()
+            try:
+                from ..lohas import ai_image
+                j = next((x for x in ai_image.jobs(client.session)
+                          if x.get("No") == rec.get("no")), None)
+                if j:
+                    state = j.get("상태") or state
+                    rec = dict(rec, state=state,
+                               ended=j.get("완료일시", ""))
+                    db.ai_job_set(rec)
+            except Exception as e:
+                self._log(f"[모니터] AI 작업 확인 실패: {str(e)[:60]}")
+                return
+
+        if state and state != self._ai_state:
+            self._ai_state = state
+            self._log(f"[AI이미지] No.{rec.get('no')} {rec.get('title')} "
+                      f"— {state}")
+        if any(state.startswith(k) for k in self.AI_END if k):
+            db.ai_job_clear()
+            self._ai_state = None
+            self.ai_done.emit(rec)
 
     def _one_cycle(self, client) -> dict:
         """1회 점검 → 표시용 현황 dict"""

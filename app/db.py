@@ -296,6 +296,138 @@ SQLITE_DDL = [
         PRIMARY KEY (cid, rank)
     )
     """,
+    # 로하스가 키워드를 형태소로 쪼갤 때 표기를 대표어로 바꾼다.
+    #   relKeyword '스텐브러쉬'  ->  terms ['스테인리스', '브러쉬']
+    # 그래서 '스텐...' 을 눌러도 이미 '스테인리스' 가 있으면 아무것도 안 들어간다.
+    # 그 대응을 모아두면 어떤 키워드가 헛클릭인지 미리 알 수 있다.
+    """
+    CREATE TABLE IF NOT EXISTS synonym (
+        surface    TEXT NOT NULL,          -- 화면에 보이는 표기 (스텐)
+        normal     TEXT NOT NULL,          -- 로하스가 쓰는 대표어 (스테인리스)
+        seen       INTEGER NOT NULL DEFAULT 1,
+        example    TEXT,                   -- 어느 키워드에서 나왔나
+        first_seen TEXT,
+        last_seen  TEXT,
+        PRIMARY KEY (surface, normal)
+    )
+    """,
+    """CREATE INDEX IF NOT EXISTS idx_syn_normal ON synonym(normal)""",
+    # 사람이 만든 상품명에서 배운 것. 원상품명에 없던 말을 카테고리별로 센다.
+    #   '데코용품' -> 장식(113) 트리(107) 오너먼트(83) 꾸미기(47)
+    #   '발매트'   -> 매트(26) 발판(22) 현관(20) 미끄럼방지(7)
+    # 그 카테고리 상품에는 이런 말을 넣는다는 뜻이라, 후보를 고를 때 우선한다.
+    """
+    CREATE TABLE IF NOT EXISTS title_pattern (
+        cid    TEXT NOT NULL,
+        word   TEXT NOT NULL,
+        n      INTEGER NOT NULL DEFAULT 0,   -- 이 카테고리에서 쓰인 횟수
+        titles INTEGER NOT NULL DEFAULT 0,   -- 이 카테고리의 학습 대상 상품명 수
+        updated_at TEXT,
+        PRIMARY KEY (cid, word)
+    )
+    """,
+    """CREATE INDEX IF NOT EXISTS idx_tp_word ON title_pattern(word)""",
+    # 사용자가 지적한 것을 **카테고리별로** 쌓는다. 같은 카테고리 상품이
+    # 다시 나오면 그대로 적용한다 (2026-09-06 지시).
+    #   ban       그 말을 쓰지 않는다 (원상품명에 있으면 맨 뒤로만)
+    #   need_name 원상품명에 있을 때만 쓴다
+    #   must      될 수 있으면 넣는다
+    """
+    CREATE TABLE IF NOT EXISTS cat_rule (
+        cid    TEXT NOT NULL,          -- 카테고리 코드 ('' = 전체)
+        scope  TEXT NOT NULL,          -- title / tag / both
+        word   TEXT NOT NULL,
+        action TEXT NOT NULL,          -- ban / need_name / must
+        note   TEXT,                   -- 사용자가 한 말 그대로
+        created_at TEXT,
+        PRIMARY KEY (cid, scope, word, action)
+    )
+    """,
+    """CREATE INDEX IF NOT EXISTS idx_catrule_cid ON cat_rule(cid)""",
+    # 프로그램 설정 한 줄짜리 값들 (품절 이동 폴더 등)
+    """
+    CREATE TABLE IF NOT EXISTS app_setting (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
+    )
+    """,
+    # 수정사항 1.0 일괄수정 이력. 어느 LCP 를 언제 처리했고 무엇을 건너뛰었나.
+    # 전상품품절은 사이트가 저장을 막으므로 시도하지 않고 'soldout' 으로 남긴다.
+    """
+    CREATE TABLE IF NOT EXISTS fix10_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id     TEXT,
+        folder_name TEXT,
+        product_code TEXT,
+        product_id TEXT,
+        direction  TEXT,          -- asc(정방향) / desc(역방향)
+        result     TEXT,          -- ok / soldout / fail
+        message    TEXT,
+        seconds    REAL,
+        created_at TEXT
+    )
+    """,
+    # AI 이미지 일괄수정 이력. **어느 폴더 몇 페이지를 이미 돌렸나** 를
+    # 남겨 두어야 같은 페이지를 두 번 걸지 않는다(2026-09-07 사용자 요청).
+    """
+    CREATE TABLE IF NOT EXISTS ai_image_job (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        folder_name TEXT NOT NULL,
+        page       INTEGER NOT NULL,
+        job_no     TEXT,
+        title      TEXT,
+        query      TEXT,
+        row_count  INTEGER,
+        first_no   TEXT,
+        last_no    TEXT,
+        state      TEXT,
+        started_at TEXT,
+        ended_at   TEXT,
+        created_at TEXT,
+        UNIQUE (folder_name, page, title)
+    )
+    """,
+    """CREATE INDEX IF NOT EXISTS idx_aiimg_folder
+           ON ai_image_job(folder_name, page)""",
+    # 상품명을 다시 만들기 전에 **지금 값을 그대로** 남겨 둔다.
+    # 일괄로 돌리면 되돌릴 방법이 있어야 한다(2026-09-07 사용자 요청).
+    """
+    CREATE TABLE IF NOT EXISTS title_backup (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id     TEXT,
+        folder_name TEXT,
+        lcp_code   TEXT,
+        l_code     TEXT NOT NULL,
+        product_no TEXT,
+        etc_category TEXT,
+        title1     TEXT,
+        product_name TEXT,
+        reason     TEXT,
+        created_at TEXT
+    )
+    """,
+    """CREATE INDEX IF NOT EXISTS idx_tbak_run ON title_backup(run_id)""",
+    """CREATE INDEX IF NOT EXISTS idx_tbak_l ON title_backup(l_code)""",
+    """CREATE INDEX IF NOT EXISTS idx_fix10_run ON fix10_log(run_id)""",
+    """CREATE INDEX IF NOT EXISTS idx_fix10_code ON fix10_log(product_code)""",
+    # 품절이라 다른 임의분류로 넘긴 내역. 나중에 "왜 이 상품이 여기 있지" 를
+    # 되짚을 수 있어야 한다 (2026-09-06 사용자 요청).
+    """
+    CREATE TABLE IF NOT EXISTS soldout_move (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          TEXT,
+        from_folder TEXT,
+        to_folder   TEXT,
+        product_code TEXT,
+        product_id  TEXT,
+        title       TEXT,
+        state       TEXT,
+        result      TEXT
+    )
+    """,
+    """CREATE INDEX IF NOT EXISTS idx_smove_code ON soldout_move(product_code)""",
+    """CREATE INDEX IF NOT EXISTS idx_smove_ts ON soldout_move(ts)""",
     """CREATE INDEX IF NOT EXISTS idx_dlk_word ON datalab_keyword(keyword)""",
     """CREATE INDEX IF NOT EXISTS idx_dlk_cid ON datalab_keyword(cid, rank)""",
     # 로하스 태그/상품명 탭에서 긁은 키워드. 카테고리(cid)가 잡힌 LCP 만 가능하다
@@ -325,6 +457,24 @@ SQLITE_DDL = [
 # ---------------------------------------------------------------- DDL (MySQL)
 
 MYSQL_DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS LOHASAUTO_AI_IMAGE_JOB (
+        local_id    INT PRIMARY KEY,
+        folder_name VARCHAR(191) NOT NULL,
+        page        INT NOT NULL,
+        job_no      VARCHAR(20),
+        title       VARCHAR(191),
+        query       VARCHAR(500),
+        row_count   INT,
+        first_no    VARCHAR(30),
+        last_no     VARCHAR(30),
+        state       VARCHAR(30),
+        started_at  VARCHAR(30),
+        ended_at    VARCHAR(30),
+        created_at  VARCHAR(30),
+        KEY idx_folder_page (folder_name, page)
+    ) DEFAULT CHARSET=utf8mb4
+    """,
     """
     CREATE TABLE IF NOT EXISTS `LOHASAUTO_CAT_KEYWORD` (
         `cid`        VARCHAR(30)  DEFAULT NULL,
@@ -550,6 +700,18 @@ MYSQL_DDL = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
     """,
     """
+    CREATE TABLE IF NOT EXISTS `LOHASAUTO_SYNONYM` (
+        `surface`    VARCHAR(100) NOT NULL,
+        `normal`     VARCHAR(100) NOT NULL,
+        `seen`       INT DEFAULT 1,
+        `example`    VARCHAR(200) DEFAULT NULL,
+        `first_seen` DATETIME DEFAULT NULL,
+        `last_seen`  DATETIME DEFAULT NULL,
+        PRIMARY KEY (`surface`, `normal`),
+        KEY `idx_normal` (`normal`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+    """,
+    """
     CREATE TABLE IF NOT EXISTS `LOHASAUTO_LCP_CATEGORY` (
         `id`       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         `lcp_code` VARCHAR(50) NOT NULL,
@@ -614,9 +776,13 @@ _initialized = False
 
 def _connect() -> sqlite3.Connection:
     config.SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(config.SQLITE_PATH))
+    # 기본 대기 5초로는 모자란다. 수집·상품명 작업이 몇 분씩 쓰기를 잡고
+    # 있으면 화면·트레이 쪽 조회가 'database is locked' 로 조용히 실패했다
+    # (2026-09-07 트레이에 어제 숫자가 남아 있던 원인 중 하나).
+    conn = sqlite3.connect(str(config.SQLITE_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -920,6 +1086,136 @@ def set_job_folder(name: str) -> None:
                         "WHERE name = %s", (name,))
         except Exception:
             pass
+
+
+def save_soldout_moves(rows: list, from_folder: str, to_folder: str,
+                       result: str = "ok") -> int:
+    """
+    품절 이동 내역을 남긴다. 로컬 SQLite + 서버 MySQL.
+
+    rows 는 fix10.parse_rows() 가 준 그대로 — product_code/product_id/title/state.
+    """
+    ts = now_str()
+    vals = [(ts, from_folder, to_folder, r.get("product_code", ""),
+             str(r.get("product_id", "")), (r.get("title") or "")[:120],
+             r.get("state", ""), result) for r in (rows or [])]
+    if not vals:
+        return 0
+    with sqlite_conn() as c:
+        c.executemany(
+            "INSERT INTO soldout_move (ts, from_folder, to_folder, "
+            "product_code, product_id, title, state, result) "
+            "VALUES (?,?,?,?,?,?,?,?)", vals)
+    conn = mysql_conn()
+    if conn is not None:
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "CREATE TABLE IF NOT EXISTS `LOHASAUTO_SOLDOUT_MOVE` ("
+                        "`id` INT AUTO_INCREMENT PRIMARY KEY,"
+                        "`ts` VARCHAR(20), `from_folder` VARCHAR(120),"
+                        "`to_folder` VARCHAR(120), `product_code` VARCHAR(40),"
+                        "`product_id` VARCHAR(20), `title` VARCHAR(200),"
+                        "`state` VARCHAR(40), `result` VARCHAR(20),"
+                        "KEY(`product_code`), KEY(`ts`))"
+                        " DEFAULT CHARSET=utf8mb4")
+                    cur.executemany(
+                        "INSERT INTO LOHASAUTO_SOLDOUT_MOVE (ts, from_folder,"
+                        " to_folder, product_code, product_id, title, state,"
+                        " result) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", vals)
+        except Exception:
+            pass
+    return len(vals)
+
+
+def soldout_moves(limit: int = 100, code: str = "") -> list:
+    """품절로 넘긴 내역 조회. 코드로 찾으면 그 상품 이력만."""
+    sql = "SELECT * FROM soldout_move"
+    a = []
+    if code:
+        sql += " WHERE product_code = ?"
+        a.append(code)
+    sql += " ORDER BY id DESC LIMIT ?"
+    a.append(limit)
+    with sqlite_conn() as c:
+        return [dict(r) for r in c.execute(sql, a)]
+
+
+def set_setting(key: str, value: str) -> None:
+    """
+    설정 한 줄 저장. 품절 이동 폴더처럼 사용자마다 다른 값에 쓴다.
+
+    로컬 SQLite 와 서버 MySQL 양쪽에 넣는다 — 다른 PC 에서도 같은 값을
+    쓰기 위해서다(2026-09-06 사용자 지시). 미러가 안 되어도 로컬은 남는다.
+    """
+    ts = now_str()
+    with sqlite_conn() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS app_setting ("
+                  "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+        c.execute("INSERT OR REPLACE INTO app_setting (key, value, updated_at)"
+                  " VALUES (?,?,?)", (key, str(value or ""), ts))
+    conn = mysql_conn()
+    if conn is not None:
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "CREATE TABLE IF NOT EXISTS `LOHASAUTO_SETTING` ("
+                        "`key` VARCHAR(64) NOT NULL PRIMARY KEY,"
+                        "`value` TEXT, `updated_at` VARCHAR(20))"
+                        " DEFAULT CHARSET=utf8mb4")
+                    cur.execute(
+                        "REPLACE INTO LOHASAUTO_SETTING (`key`,`value`,"
+                        "`updated_at`) VALUES (%s,%s,%s)",
+                        (key, str(value or ""), ts))
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------ AI 이미지 작업
+# 걸어둔 AI 이미지 일괄작업 한 건을 여기에 적어둔다. **예약된 작업이 있을
+# 때만** 로하스 작업결과 화면을 본다 - 없는데 매 주기 긁으면 헛일이다
+# (2026-09-07 사용자: "불필요한 로하스 크롤링은 자제하자").
+AI_JOB_KEY = "ai_job_watch"
+
+
+def ai_job_set(rec: dict) -> None:
+    """진행 중인 AI 이미지 작업을 기록한다(폴링하는 쪽이 갱신)."""
+    import json
+
+    rec = dict(rec or {})
+    rec["updated_at"] = now_str()
+    set_setting(AI_JOB_KEY, json.dumps(rec, ensure_ascii=False))
+
+
+def ai_job_get() -> dict:
+    """걸어둔 AI 이미지 작업. 없으면 빈 dict."""
+    import json
+
+    v = get_setting(AI_JOB_KEY, "")
+    if not v:
+        return {}
+    try:
+        return json.loads(v)
+    except Exception:
+        return {}
+
+
+def ai_job_clear() -> None:
+    set_setting(AI_JOB_KEY, "")
+
+
+def get_setting(key: str, default: str = "") -> str:
+    try:
+        with sqlite_conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS app_setting ("
+                      "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+            r = c.execute("SELECT value FROM app_setting WHERE key = ?",
+                          (key,)).fetchone()
+        return (r["value"] if r else "") or default
+    except Exception:
+        return default
 
 
 def get_job_folder() -> Optional[str]:
@@ -2450,13 +2746,27 @@ def lcp_category_search(keyword: str = "", only_split: bool = False,
     return out[:limit]
 
 
-def lcode_rows_of(lcp_code: str) -> list:
-    """한 LCP 의 L코드 목록 (카테고리 수정 대상)."""
+def lcode_rows_of(lcp_code: str, folder_name: str = None,
+                  all_folders: bool = False) -> list:
+    """
+    한 LCP 의 L코드 목록.
+
+    같은 LCP 가 여러 작업폴더에 걸쳐 있을 수 있다. 폴더를 안 거르면 지금
+    작업폴더가 아닌 상품까지 손대게 되므로 **기본이 작업폴더 한정**이다.
+    전부 보려면 all_folders=True 를 준다.
+    """
+    sql = ("SELECT l_code, product_no, etc_category, cat_saved, title_saved, "
+           "       tag_count, title1, next_step, folder_name FROM lcode_attr "
+           "WHERE lcp_code = ?")
+    args = [lcp_code]
+    if not all_folders:
+        folder = folder_name or get_job_folder()
+        if folder:
+            sql += " AND folder_name = ?"
+            args.append(folder)
+    sql += " ORDER BY l_code"
     with sqlite_conn() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT l_code, product_no, etc_category, cat_saved, title_saved, "
-            "       tag_count, title1, next_step FROM lcode_attr "
-            "WHERE lcp_code = ? ORDER BY l_code", (lcp_code,))]
+        return [dict(r) for r in c.execute(sql, args)]
 
 def tag_work_rows(folder_name: str = None, day: str = "",
                   limit: int = 2000) -> list:
@@ -2526,3 +2836,385 @@ def sync_info_status(folder_name: str, by_status: dict) -> dict:
                 n += cur.rowcount
             out[status] = n
     return out
+
+def save_synonyms(pairs: list) -> dict:
+    """
+    동의어 대응을 쌓는다. pairs: [(surface, normal, example), ...]
+
+    같은 대응을 여러 번 보면 `seen` 이 올라간다 — 자주 보이는 것일수록 믿을
+    만하다. 한 번만 보인 것은 형태소 분석이 튄 것일 수 있다.
+    """
+    ts = now_str()
+    n = 0
+    with sqlite_conn() as c:
+        for surface, normal, example in pairs:
+            surface = (surface or "").strip()
+            normal = (normal or "").strip()
+            if not surface or not normal or surface == normal:
+                continue
+            c.execute(
+                "INSERT INTO synonym (surface, normal, seen, example, "
+                "                     first_seen, last_seen) "
+                "VALUES (?,?,1,?,?,?) "
+                "ON CONFLICT(surface, normal) DO UPDATE SET "
+                "  seen = seen + 1, last_seen = excluded.last_seen",
+                (surface, normal, example, ts, ts))
+            n += 1
+
+    mirror = ""
+    conn2 = mysql_conn()
+    if conn2 is not None:
+        try:
+            rows = [(a, b, c2, ts, ts) for a, b, c2 in pairs
+                    if (a or "").strip() and (b or "").strip() and a != b]
+            with conn2:
+                mysql_prepare(conn2)
+                with conn2.cursor() as cur:
+                    for i in range(0, len(rows), 300):
+                        cur.executemany(
+                            "INSERT INTO LOHASAUTO_SYNONYM "
+                            "(`surface`,`normal`,`seen`,`example`,"
+                            " `first_seen`,`last_seen`) "
+                            "VALUES (%s,%s,1,%s,%s,%s) "
+                            "ON DUPLICATE KEY UPDATE "
+                            "  `seen`=`seen`+1, `last_seen`=VALUES(`last_seen`)",
+                            rows[i:i + 300])
+            mirror = f"MySQL 미러 {len(rows):,}행"
+        except Exception as e:
+            mirror = f"MySQL 미러 실패: {e}"
+    return {"rows": n, "mirror": mirror}
+
+
+def synonym_map(min_seen: int = 1) -> dict:
+    """{표기: 대표어}. 여러 대표어가 잡히면 가장 자주 본 것을 쓴다."""
+    out = {}
+    with sqlite_conn() as c:
+        for r in c.execute(
+                "SELECT surface, normal, seen FROM synonym WHERE seen >= ? "
+                "ORDER BY seen DESC", (min_seen,)):
+            out.setdefault(r["surface"], r["normal"])
+    return out
+
+_TITLE_BAN_SEED = [
+    # 화장실·주방 설비 타사 브랜드. 후보 표에는 같은 카테고리의 남의 제품명이
+    # 그대로 섞여 온다 - '이누스 미니세면대' 에 '대림세면대' 가 붙었다(2026-09-05).
+    "대림", "이누스", "로얄토토", "아메리칸스탠다드", "계림", "아메리칸",
+]
+
+
+_TITLE_VOCAB = None
+
+
+def title_word_vocab() -> set:
+    """
+    사람이 만든 상품명에 실제로 쓰인 낱말 전부(`title_pattern` 에서).
+
+    여기 없는 말은 **상표일 가능성이 높다**. 4,723건을 학습한 사전이라
+    평범한 말은 거의 다 들어 있다. 막지는 않고 뒤로 미는 용도다.
+    """
+    global _TITLE_VOCAB
+    if _TITLE_VOCAB is None:
+        try:
+            with sqlite_conn() as c:
+                _TITLE_VOCAB = {r["word"] for r in
+                                c.execute("SELECT DISTINCT word FROM title_pattern")}
+        except Exception:
+            _TITLE_VOCAB = set()
+    return _TITLE_VOCAB
+
+
+_CAT_NAME = None
+
+
+def category_name(code: str) -> str:
+    """
+    카테고리 코드의 이름. '... / 공기청정기필터' 처럼 상품 종류가 들어 있다.
+
+    카테고리 이름에 있는 말은 그 상품에 **원래 있는 성질**이다. 공기청정기
+    필터 상품의 상품명에서 '필터' 를 빼면 안 된다(2026-09-05).
+    """
+    global _CAT_NAME
+    if _CAT_NAME is None:
+        try:
+            with sqlite_conn() as c:
+                _CAT_NAME = {str(r["code"]): r["name"] or "" for r in
+                             c.execute("SELECT DISTINCT code, name "
+                                       "FROM lcp_category")}
+        except Exception:
+            _CAT_NAME = {}
+    return _CAT_NAME.get(str(code or ""), "")
+
+
+def save_cat_rule(cid: str, scope: str, word: str, action: str,
+                  note: str = "") -> None:
+    """사용자 지적을 카테고리별로 남긴다. 다음에 같은 카테고리에서 쓴다."""
+    with sqlite_conn() as c:
+        c.execute("INSERT OR REPLACE INTO cat_rule "
+                  "(cid, scope, word, action, note, created_at) "
+                  "VALUES (?,?,?,?,?,?)",
+                  (str(cid or ""), scope, word, action, note, now_str()))
+
+
+def cat_rules(cid: str, scope: str = "title") -> dict:
+    """
+    그 카테고리에 쌓인 지침. 전체('') 규칙도 함께 준다.
+
+    반환 {'ban': {...}, 'need_name': {...}, 'must': [...]}
+    """
+    out = {"ban": set(), "need_name": set(), "must": [], "loose": set()}
+    try:
+        with sqlite_conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS cat_rule ("
+                      "cid TEXT NOT NULL, scope TEXT NOT NULL, "
+                      "word TEXT NOT NULL, action TEXT NOT NULL, note TEXT, "
+                      "created_at TEXT, PRIMARY KEY (cid, scope, word, action))")
+            for r in c.execute(
+                    "SELECT word, action FROM cat_rule "
+                    "WHERE cid IN ('', ?) AND scope IN ('both', ?)",
+                    (str(cid or ""), scope)):
+                if r["action"] == "must":
+                    out["must"].append(r["word"])
+                elif r["action"] == "loose":
+                    out["loose"].add(r["word"])
+                elif r["action"] in out:
+                    out[r["action"]].add(r["word"])
+    except Exception:
+        pass
+    return out
+
+
+def cat_rule_list(cid: str = "") -> list:
+    """화면·보고용 목록."""
+    sql = ("SELECT cid, scope, word, action, note, created_at FROM cat_rule")
+    a = []
+    if cid:
+        sql += " WHERE cid IN ('', ?)"
+        a.append(str(cid))
+    sql += " ORDER BY created_at DESC"
+    with sqlite_conn() as c:
+        return [dict(r) for r in c.execute(sql, a)]
+
+
+def title_bans() -> set:
+    """상품명에 넣지 않을 말(타사 브랜드 등). 원상품명에 있으면 예외로 허용한다."""
+    out = set(_TITLE_BAN_SEED)
+    try:
+        with sqlite_conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS title_ban ("
+                      "word TEXT PRIMARY KEY, memo TEXT, updated_at TEXT)")
+            out |= {r["word"] for r in c.execute("SELECT word FROM title_ban")}
+    except Exception:
+        pass
+    return {w for w in out if w}
+
+
+def add_title_ban(words, memo: str = "") -> int:
+    """타사 브랜드를 사전에 추가한다(사용자가 잡아준 것을 쌓는 자리)."""
+    ts = now_str()
+    rows = [(w.strip(), memo, ts) for w in (words or []) if w and w.strip()]
+    if not rows:
+        return 0
+    with sqlite_conn() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS title_ban ("
+                  "word TEXT PRIMARY KEY, memo TEXT, updated_at TEXT)")
+        c.executemany("INSERT OR REPLACE INTO title_ban (word, memo, updated_at)"
+                      " VALUES (?,?,?)", rows)
+    return len(rows)
+
+
+def save_fix10_log(run_id: str, folder: str, row: dict, direction: str,
+                   res: dict, seconds: float = 0.0) -> None:
+    """수정사항 1.0 처리 한 건을 남긴다. 실패해도 작업은 멈추지 않는다."""
+    try:
+        with sqlite_conn() as c:
+            c.execute(
+                "INSERT INTO fix10_log (run_id, folder_name, product_code, "
+                "product_id, direction, result, message, seconds, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (run_id, folder, row.get("product_code", ""),
+                 str(row.get("product_id", "")), direction,
+                 res.get("result", ""), (res.get("message") or "")[:200],
+                 round(float(seconds or 0), 2), now_str()))
+    except Exception:
+        pass
+
+
+def fix10_runs(limit: int = 20) -> list:
+    """최근 실행 요약. 화면에 '언제 몇 건 돌렸나' 를 보여주는 값이다."""
+    with sqlite_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT run_id, folder_name, MIN(created_at) started, "
+            "       MAX(created_at) ended, COUNT(*) n, "
+            "       SUM(result='ok') ok, SUM(result='soldout') soldout, "
+            "       SUM(result='fail') fail "
+            "FROM fix10_log GROUP BY run_id "
+            "ORDER BY started DESC LIMIT ?", (limit,))]
+
+
+def fix10_last_run(folder: str = "") -> dict:
+    """그 폴더를 마지막으로 돌린 시각. 주 1회 자동 실행 판단에 쓴다."""
+    sql = "SELECT MAX(created_at) t FROM fix10_log"
+    args = []
+    if folder:
+        sql += " WHERE folder_name = ?"
+        args.append(folder)
+    with sqlite_conn() as c:
+        r = c.execute(sql, args).fetchone()
+    return {"at": (r["t"] if r else "") or ""}
+
+
+def save_title_backup(run_id: str, rows: list) -> int:
+    """상품명을 바꾸기 전에 지금 값을 남긴다. 되돌릴 근거다."""
+    ts = now_str()
+    data = [(run_id, r.get("folder_name", ""), r.get("lcp_code", ""),
+             r.get("l_code", ""), str(r.get("product_no", "")),
+             str(r.get("etc_category", "")), r.get("title1", ""),
+             r.get("product_name", ""), r.get("reason", ""), ts)
+            for r in (rows or []) if r.get("l_code")]
+    if not data:
+        return 0
+    with sqlite_conn() as c:
+        c.executemany(
+            "INSERT INTO title_backup (run_id, folder_name, lcp_code, l_code,"
+            " product_no, etc_category, title1, product_name, reason,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", data)
+    return len(data)
+
+
+def title_backups(run_id: str = "", l_code: str = "") -> list:
+    sql = "SELECT * FROM title_backup WHERE 1=1"
+    a = []
+    if run_id:
+        sql += " AND run_id = ?"
+        a.append(run_id)
+    if l_code:
+        sql += " AND l_code = ?"
+        a.append(l_code)
+    sql += " ORDER BY id"
+    try:
+        with sqlite_conn() as c:
+            return [dict(r) for r in c.execute(sql, a)]
+    except Exception:
+        return []
+
+
+def title_backup_runs(limit: int = 20) -> list:
+    """언제 무엇을 몇 건 백업했나."""
+    try:
+        with sqlite_conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT run_id, MIN(created_at) at, COUNT(*) n "
+                "FROM title_backup GROUP BY run_id "
+                "ORDER BY at DESC LIMIT ?", (limit,))]
+    except Exception:
+        return []
+
+
+def save_ai_job(rec: dict) -> int:
+    """
+    AI 이미지 일괄수정 **한 페이지** 결과를 남긴다. 로컬 + 서버 양쪽에.
+
+    이 기록이 있어야 "엑사는 1·2페이지 했다" 를 프로그램이 안다 —
+    다음에 열 때 시작 페이지를 자동으로 3으로 잡는다(2026-09-07 사용자).
+    """
+    ts = now_str()
+    row = (rec.get("folder") or rec.get("folder_name") or "",
+           int(rec.get("page") or 0), str(rec.get("no") or ""),
+           rec.get("title") or "", rec.get("query") or "",
+           int(rec.get("count") or 0), str(rec.get("first") or ""),
+           str(rec.get("last") or ""), rec.get("state") or "",
+           rec.get("started") or "", rec.get("ended") or "", ts)
+    local_id = 0
+    try:
+        with sqlite_conn() as c:
+            cur = c.execute(
+                "INSERT INTO ai_image_job (folder_name, page, job_no, title, "
+                "query, row_count, first_no, last_no, state, started_at, "
+                "ended_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(folder_name, page, title) DO UPDATE SET "
+                "job_no=excluded.job_no, state=excluded.state, "
+                "row_count=excluded.row_count, "
+                "started_at=excluded.started_at, ended_at=excluded.ended_at",
+                row)
+            local_id = cur.lastrowid or 0
+            if not local_id:
+                r = c.execute(
+                    "SELECT id FROM ai_image_job WHERE folder_name=? AND "
+                    "page=? AND title=?", (row[0], row[1], row[3])).fetchone()
+                local_id = r["id"] if r else 0
+    except Exception:
+        return 0
+    _mirror_ai_job(local_id, row)
+    return local_id
+
+
+def _mirror_ai_job(local_id: int, row) -> None:
+    conn = mysql_conn()
+    if conn is None or not local_id:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for ddl in MYSQL_DDL:
+                    cur.execute(ddl)
+                cur.execute(
+                    "INSERT INTO LOHASAUTO_AI_IMAGE_JOB (local_id, "
+                    "folder_name, page, job_no, title, query, row_count, "
+                    "first_no, last_no, state, started_at, ended_at, "
+                    "created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s) ON DUPLICATE KEY UPDATE job_no=VALUES(job_no), "
+                    "state=VALUES(state), row_count=VALUES(row_count), "
+                    "started_at=VALUES(started_at), ended_at=VALUES(ended_at)",
+                    (local_id,) + tuple(row))
+    except Exception:
+        pass
+
+
+def ai_jobs(folder: str = "", limit: int = 200) -> list:
+    """AI 이미지 일괄수정 이력 (최근 순)."""
+    sql = "SELECT * FROM ai_image_job"
+    a = []
+    if folder:
+        sql += " WHERE folder_name = ?"
+        a.append(folder)
+    sql += " ORDER BY id DESC LIMIT ?"
+    a.append(limit)
+    try:
+        with sqlite_conn() as c:
+            return [dict(r) for r in c.execute(sql, a)]
+    except Exception:
+        return []
+
+
+def ai_done_pages(folder: str) -> set:
+    """그 폴더에서 **이미 완료한** 페이지 번호. 중복 작업을 막는 근거다."""
+    try:
+        with sqlite_conn() as c:
+            return {r["page"] for r in c.execute(
+                "SELECT DISTINCT page FROM ai_image_job "
+                "WHERE folder_name = ? AND state = '완료'", (folder,))}
+    except Exception:
+        return set()
+
+
+def save_title_patterns(cid: str, counts: dict, n_titles: int) -> int:
+    """카테고리별 '사람이 더 넣은 말' 을 저장한다."""
+    ts = now_str()
+    rows = [(str(cid), w, n, n_titles, ts) for w, n in (counts or {}).items()
+            if w and n > 0]
+    if not rows:
+        return 0
+    with sqlite_conn() as c:
+        c.execute("DELETE FROM title_pattern WHERE cid = ?", (str(cid),))
+        c.executemany(
+            "INSERT INTO title_pattern (cid, word, n, titles, updated_at) "
+            "VALUES (?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def title_patterns(cid: str, min_n: int = 2) -> dict:
+    """{말: 횟수}. 그 카테고리 상품명에 자주 들어간 말."""
+    with sqlite_conn() as c:
+        return {r["word"]: r["n"] for r in c.execute(
+            "SELECT word, n FROM title_pattern WHERE cid = ? AND n >= ? "
+            "ORDER BY n DESC", (str(cid), min_n))}

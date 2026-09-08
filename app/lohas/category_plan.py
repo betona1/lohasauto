@@ -138,10 +138,30 @@ def save_group(session, item: dict, code: str, *, capacity="", unit="",
     ok, fail, saved = 0, 0, []
     for r in item["rows"]:
         try:
+            # 총 용량은 **L코드마다 다르다** — 같은 LCP 안에 450g 짜리와
+            # 450g X15 짜리가 같이 있다. 사람이 값을 주지 않았고 카테고리에
+            # 단위가 있으면, 그 상품 원상품명에서 읽어 넣는다
+            # (2026-09-07 사용자: "앞으로 상품명에 있는것은 자동으로
+            #  카테고리 조사하면서 넣어줘"). 모르면 비워 둔다.
+            tc = total_capacity
+            how = ""
+            if unit and not tc:
+                try:
+                    from . import tabs as _tabs
+
+                    pn = _tabs.fetch_attr(
+                        session, r["product_no"]).get("product_name", "")
+                    val, how = category.parse_capacity(pn, unit)
+                    if val:
+                        tc = str(val)
+                except Exception:
+                    tc = total_capacity
             res = category.save_category(
                 session, r["product_no"], r["l_code"], code,
-                capacity=capacity, unit=unit, total_capacity=total_capacity,
+                capacity=capacity, unit=unit, total_capacity=tc,
                 current=r.get("etc_category") or "")
+            if res.get("ok") and tc and tc != total_capacity:
+                log(f"     {r['l_code']} 용량 {how} = {tc}{unit}")
             if res["ok"]:
                 ok += 1
                 saved.append(r)

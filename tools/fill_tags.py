@@ -25,7 +25,8 @@ from app.lohas import (attr_detail, session as ses,       # noqa: E402
                        tag_auto)
 
 
-def targets(lcp: str = "", todo_only: bool = True, only: set = None):
+def targets(lcp: str = "", todo_only: bool = True, only: set = None,
+            folder: str = ""):
     """
     태그가 비어 있는 L코드를 LCP 단위로 묶는다. LCP 코드 오름차순이다.
 
@@ -40,8 +41,9 @@ def targets(lcp: str = "", todo_only: bool = True, only: set = None):
         sql += ("JOIN lcp_lcode c ON c.product_no = a.product_no "
                 "  AND c.img_status = '이미지승인완료' "
                 "  AND c.info_status = '미작업' ")
-    sql += "WHERE a.cat_saved = 1 AND a.tag_count = 0"
-    args = []
+    sql += ("WHERE a.cat_saved = 1 AND a.tag_count = 0 "
+            "  AND a.folder_name = ?")
+    args = [folder or db.get_job_folder()]
     if lcp:
         sql += " AND a.lcp_code = ?"
         args.append(lcp)
@@ -55,14 +57,15 @@ def targets(lcp: str = "", todo_only: bool = True, only: set = None):
     return groups
 
 
-def redo_targets(only: set):
+def redo_targets(only: set, folder: str = ""):
     """이미 태그가 있어도 다시 잡을 LCP (규칙이 바뀌었을 때 쓴다)."""
     groups = {}
     with db.sqlite_conn() as c:
         for r in c.execute(
                 "SELECT lcp_code, l_code, product_no, etc_category, tag_count "
                 "FROM lcode_attr WHERE cat_saved = 1 "
-                "ORDER BY lcp_code, l_code"):
+                "  AND folder_name = ? ORDER BY lcp_code, l_code",
+                (folder or db.get_job_folder(),)):
             if r["lcp_code"] in only:
                 groups.setdefault(r["lcp_code"], []).append(dict(r))
     return groups
@@ -83,6 +86,9 @@ def main():
                     help="태그가 5개 미만이면 상품명 후보로 채운다")
     ap.add_argument("--all", action="store_true",
                     help="미작업목록 범위를 넘어 카테고리 저장분 전부")
+    ap.add_argument("--folder", default="",
+                    help="이 작업폴더로. 비우면 지정된 작업폴더"
+                         " (마스터폴더가 여럿일 때 쓴다)")
     args = ap.parse_args()
 
     only = None
@@ -90,9 +96,10 @@ def main():
         only = {x.strip() for x in open(args.lcp_file, encoding="utf-8")
                 if x.strip()}
     if only and args.overwrite:
-        groups = redo_targets(only)          # 이미 있는 것도 다시
+        groups = redo_targets(only, args.folder)   # 이미 있는 것도 다시
     else:
-        groups = targets(args.lcp, todo_only=not args.all, only=only)
+        groups = targets(args.lcp, todo_only=not args.all, only=only,
+                         folder=args.folder)
     names = list(groups)
     if args.limit:
         names = names[:args.limit]
@@ -145,7 +152,7 @@ def main():
             except Exception:
                 pass
         if out:
-            db.save_lcode_attr(db.get_job_folder(), out)
+            db.save_lcode_attr(args.folder or db.get_job_folder(), out)
 
         el = time.time() - t0
         eta = (el / i) * (len(names) - i) / 60

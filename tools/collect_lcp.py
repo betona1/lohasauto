@@ -28,13 +28,19 @@ for a in sys.argv[1:]:
         LIMIT = int(a)
 
 
+FOLDER = ""
+for i, a in enumerate(sys.argv[1:]):
+    if a == "--folder" and i + 2 <= len(sys.argv) - 1:
+        FOLDER = sys.argv[i + 2]
+
+
 def log(m):
     print(m, flush=True)
 
 
 def main():
     db.init_db()
-    folder = db.get_job_folder()
+    folder = FOLDER or db.get_job_folder()
     if not folder:
         log("!! 작업폴더가 지정되어 있지 않습니다.")
         return 1

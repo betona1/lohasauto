@@ -108,6 +108,18 @@ class MiniWindow(QWidget):
             " padding:0 16px; border-radius:4px; }")
         self.btn_big.clicked.connect(self.to_big)
         row.addWidget(self.btn_big)
+
+        self.btn_tray = QPushButton("트레이")
+        self.btn_tray.setMinimumHeight(34)
+        self.btn_tray.setToolTip(
+            "창을 감추고 트레이 아이콘만 남깁니다 (Ctrl+T)." + chr(10)
+            + "오늘 작업량이 늘면 알림으로 알려줍니다.")
+        self.btn_tray.setShortcut("Ctrl+T")
+        self.btn_tray.setStyleSheet(
+            "QPushButton { background:#37474f; color:white; font-weight:bold;"
+            " padding:0 12px; border-radius:4px; }")
+        self.btn_tray.clicked.connect(self._to_tray)
+        row.addWidget(self.btn_tray)
         root.addLayout(row)
 
         self.lbl_state = QLabel("")
@@ -134,6 +146,11 @@ class MiniWindow(QWidget):
             self.card_done.set(int((last or {}).get("info_save_rows") or 0))
         except Exception:
             self.card_done.set("-")
+
+    def _to_tray(self):
+        """트레이로 내린다. 큰 창 쪽 기능을 그대로 쓴다."""
+        self.hide()
+        self.main.to_tray()
 
     def set_state(self, text: str):
         self.lbl_state.setText(text or "")

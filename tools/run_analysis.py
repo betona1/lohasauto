@@ -14,10 +14,12 @@ def log(m): print(m, flush=True)
 
 def main():
     db.init_db()
-    folder = db.get_job_folder()
+    folder = next((sys.argv[i + 1] for i, a in enumerate(sys.argv)
+                   if a == "--folder" and i + 1 < len(sys.argv)),
+                  "") or db.get_job_folder()
     if not folder:
         log("!! 작업폴더 미지정"); return 1
-    limit = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    limit = next((int(a) for a in sys.argv[1:] if a.isdigit()), 0)
 
     client = get_client(log=log)
     done = db.done_lcp_set()

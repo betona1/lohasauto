@@ -42,7 +42,9 @@ def log(m):
 
 def main():
     db.init_db()
-    folder = db.get_job_folder()
+    folder = next((sys.argv[i + 1] for i, a in enumerate(sys.argv)
+                   if a == "--folder" and i + 1 < len(sys.argv)),
+                  "") or db.get_job_folder()
     client = get_client(log=log)
     s = client.session
 

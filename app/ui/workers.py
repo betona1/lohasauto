@@ -13,6 +13,7 @@ from ..lohas import preview as preview_mod
 from ..lohas import collect as collect_mod
 from ..lohas import lcode_status
 from ..lohas import category_plan
+from ..lohas import fix10
 
 
 class BaseWorker(QObject):
@@ -171,14 +172,140 @@ class DumpWorker(BaseWorker):
                     pass
 
 
-class AnalysisWorker(BaseWorker):
-    """ALL 상품분석 : 작업폴더의 미분석 LCP 를 찾아 분석 요청 → 완료 기록."""
+class AiImageWorker(BaseWorker):
+    """
+    AI 이미지 일괄수정 — 시작 페이지부터 끝 페이지까지 **한 번에 하나씩** 건다.
 
-    def __init__(self, folder_name: str, batch_size: int, poll_interval: int,
+    로하스는 작업을 하나만 돌린다. 그래서 한 페이지를 걸고 완료를 기다렸다가
+    다음 페이지를 건다(2026-09-07 사용자: "3페이지 선택하면 거기부터 끝까지").
+
+    **폴링은 여기 한 곳에서만 한다.** 진행 상태를 `db.ai_job_set()` 으로
+    적어두고, 자동점검은 그 기록만 읽는다 — 같은 화면을 두 곳에서 긁지
+    않기 위해서다(사용자: "불필요한 로하스 크롤링은 자제하자").
+    """
+
+    POLL_SEC = 120             # 1,000건에 32분. 2분마다면 진행이 보인다
+
+    def __init__(self, folder_name: str, page_from: int, page_to: int,
+                 title: str, query: str, headless: bool = False,
+                 monitor: int = 0):
+        super().__init__(headless, monitor, use_http=True)
+        self.folder_name = folder_name
+        self.page_from = int(page_from)
+        self.page_to = max(int(page_to), int(page_from))
+        self.title = title
+        self.query = query
+
+    def run(self):
+        import time
+
+        from ..lohas import ai_image
+
+        done, t0 = [], time.time()
+        try:
+            client = get_client(self.headless, self.monitor, log=self._log)
+            pages = range(self.page_from, self.page_to + 1)
+            self._log(f"'{self.folder_name}' {self.page_from}~{self.page_to}"
+                      f"페이지 AI 이미지 일괄수정 ({len(pages)}회) — "
+                      f"질의어 '{self.query}'")
+
+            for n, page in enumerate(pages, 1):
+                if self.should_stop():
+                    self._log("중지 요청 — 남은 페이지는 걸지 않습니다")
+                    break
+                title = ai_image.title_for(self.title, page)
+                res = ai_image.run_page(client, self.folder_name, page,
+                                        title, query=self.query, dry=False)
+                if not res.get("ok"):
+                    self._log(f"  !! {page}페이지 {res.get('reason', '')}")
+                    if res.get("reason", "").startswith("그 페이지"):
+                        break          # 마지막 페이지를 지났다
+                    continue
+                self._log(f"  [{n}/{len(pages)}] {page}페이지 "
+                          f"{res['count']:,}건 접수 — {title}")
+
+                job = ai_image.find_job(client.session, title)
+                no = job.get("No", "")
+                rec = {"no": no, "title": title, "folder": self.folder_name,
+                       "page": page, "count": res["count"],
+                       "query": self.query, "first": res.get("first"),
+                       "last": res.get("last"), "state": job.get("상태"),
+                       "started": job.get("시작일시", ""), "ended": ""}
+                db.ai_job_set(rec)
+                db.save_ai_job(rec)
+
+                last = None
+                while no and not self.should_stop():
+                    j = next((x for x in ai_image.jobs(client.session)
+                              if x.get("No") == no), None)
+                    if not j:
+                        break
+                    if j.get("상태") != last:
+                        last = j.get("상태")
+                        self._log(f"      No.{no} {last}")
+                        rec.update(state=last,
+                                   started=j.get("시작일시", ""),
+                                   ended=j.get("완료일시", ""))
+                        db.ai_job_set(rec)
+                        # 화면에 그대로 보여줄 상태를 함께 보낸다
+                        self.stat.emit({
+                            "processed": n, "total": len(pages),
+                            "state": last, "page": page, "no": no,
+                            "done_pages": n - 1, "title": title,
+                        })
+                    if last in ("완료", "취소완료", "실패", "오류"):
+                        res["job"] = j
+                        break
+                    time.sleep(self.POLL_SEC)
+                # 끝난 페이지는 **로컬 DB + 서버**에 남긴다 - 다음에 같은
+                # 페이지를 또 걸지 않기 위해서다(2026-09-07 사용자 요청).
+                # 마지막 상태를 못 본 채 다음 작업으로 넘어가는 일이 있어,
+                # 결과 화면에서 그 작업을 한 번 더 확인해 확정한다.
+                fin = next((x for x in ai_image.jobs(client.session)
+                            if x.get("No") == no), None)
+                if fin:
+                    rec.update(state=fin.get("상태"),
+                               started=fin.get("시작일시", ""),
+                               ended=fin.get("완료일시", ""))
+                db.save_ai_job(rec)
+                self.stat.emit({"processed": n, "total": len(pages),
+                                "state": rec.get("state") or "", "page": page,
+                                "no": no, "done_pages": n, "title": title})
+                done.append(res)
+                if (res.get("job") or {}).get("상태") not in (None, "완료"):
+                    self._log("      완료가 아니어서 다음 페이지로 넘어가지 않습니다")
+                    break
+
+            db.ai_job_clear()
+            self.finished.emit({
+                "folder": self.folder_name, "pages": len(done),
+                "from": self.page_from, "to": self.page_to,
+                "count": sum(x.get("count", 0) for x in done),
+                "query": self.query, "title": self.title,
+                "results": done, "seconds": round(time.time() - t0, 1),
+            })
+        except Exception as e:
+            db.ai_job_clear()
+            self._log(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+class AnalysisWorker(BaseWorker):
+    """
+    ALL 상품분석 : 미분석 LCP 를 찾아 분석 요청 → 완료 기록.
+
+    `folder_name` 은 폴더 하나여도 되고 **여러 폴더의 목록**이어도 된다.
+    폴더가 넷으로 늘어난 뒤 작업폴더 하나만 분석되던 것을 고쳤다
+    (2026-09-07 사용자 요청). 여럿이면 순서대로 돌고 합계를 돌려준다.
+    """
+
+    def __init__(self, folder_name, batch_size: int, poll_interval: int,
                  batch_timeout: int, headless: bool = False, monitor: int = 0,
                  limit: int = 0, use_queue: bool = True):
         super().__init__(headless, monitor, use_http=True)
-        self.folder_name = folder_name
+        self.folders = ([folder_name] if isinstance(folder_name, str)
+                        else [f for f in (folder_name or []) if f])
+        self.folder_name = self.folders[0] if self.folders else ""
         self.batch_size = batch_size
         self.poll_interval = poll_interval
         self.batch_timeout = batch_timeout
@@ -188,27 +315,39 @@ class AnalysisWorker(BaseWorker):
     def run(self):
         try:
             client = get_client(self.headless, self.monitor, log=self._log)
-            done = db.done_lcp_set()
-            queue = db.list_queue(self.folder_name) if self.use_queue else None
-            if queue:
-                self._log(f"저장된 미분석 대기열 {len(queue):,}종 발견 → 검색 생략")
-            self._log(f"작업폴더 '{self.folder_name}' ALL 상품분석 시작 "
-                      f"(기록된 완료 LCP {len(done):,}종)")
+            total = {}
+            for i, folder in enumerate(self.folders, 1):
+                if self.should_stop():
+                    break
+                done = db.done_lcp_set()
+                queue = db.list_queue(folder) if self.use_queue else None
+                if queue:
+                    self._log(f"저장된 미분석 대기열 {len(queue):,}종 발견 → 검색 생략")
+                head = (f"[{i}/{len(self.folders)}] "
+                        if len(self.folders) > 1 else "")
+                self._log(f"{head}작업폴더 '{folder}' ALL 상품분석 시작 "
+                          f"(기록된 완료 LCP {len(done):,}종)")
 
-            stats = run_all_analysis(
-                client, self.folder_name, done,
-                batch_size=self.batch_size,
-                poll_interval=self.poll_interval,
-                batch_timeout=self.batch_timeout,
-                log=self._log,
-                progress=lambda d, t: self.progress.emit(d, t),
-                should_stop=self.should_stop,
-                on_record=self._record,
-                limit=self.limit,
-                on_stat=lambda st: self.stat.emit(st),
-                queue=queue,
-            )
-            self.finished.emit(stats)
+                stats = run_all_analysis(
+                    client, folder, done,
+                    batch_size=self.batch_size,
+                    poll_interval=self.poll_interval,
+                    batch_timeout=self.batch_timeout,
+                    log=self._log,
+                    progress=lambda d, t: self.progress.emit(d, t),
+                    should_stop=self.should_stop,
+                    on_record=self._record,
+                    limit=self.limit,
+                    on_stat=lambda st: self.stat.emit(st),
+                    queue=queue,
+                )
+                for k, v in (stats or {}).items():
+                    if isinstance(v, (int, float)):
+                        total[k] = total.get(k, 0) + v
+                    else:
+                        total.setdefault(k, v)
+            total["folders"] = len(self.folders)
+            self.finished.emit(total)
         except Exception as e:
             self._log(traceback.format_exc())
             self.failed.emit(str(e))
@@ -871,6 +1010,69 @@ class TagSaveWorker(BaseWorker):
             self.finished.emit(res)
         except Exception as e:
             self.failed.emit(f"{e}\n{traceback.format_exc()[:600]}")
+
+class Fix10Worker(BaseWorker):
+    """
+    수정사항 1.0 일괄수정. **정방향·역방향을 동시에** 돌린다.
+
+    사이트 마법사를 HTTP 로 그대로 재현하므로 브라우저가 뜨지 않는다.
+    목록 앞뒤에서 서로 마주 보고 좁혀 오기 때문에 시간이 절반으로 준다.
+    묶인 상품이 전부 품절인 LCP 는 시도하지 않고 건너뛴다.
+    """
+
+    def __init__(self, folder_name: str = None, both: bool = True,
+                 limit: int = 0):
+        super().__init__(False, 0, use_http=True)
+        self.folder_name = folder_name
+        self.both = both
+        self.limit = limit
+
+    def run(self):
+        try:
+            client = get_client(self.headless, self.monitor, log=self._log)
+            folders = self.folder_name or db.get_job_folder()
+            if isinstance(folders, str):
+                folders = [folders]
+            tot = {"total": 0, "ok": 0, "soldout": 0, "fail": 0, "seconds": 0}
+            for f in [x for x in folders if x]:
+                res = fix10.bulk(
+                    lambda: fix10.clone_session(client.session), f,
+                    both=self.both, limit=self.limit, log=self._log,
+                    stop=self.should_stop)
+                for k in tot:
+                    tot[k] += (res.get(k) or 0)
+            self.finished.emit(tot)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class SoldoutSweepWorker(BaseWorker):
+    """
+    수정사항이 있으면서 **품절**인 광고상품을 찾아 지정한 폴더로 넘긴다.
+
+    화면에서 하던 것과 같다 — 임의분류 고르고 '수정사항유' + 상태 '품절' 로
+    검색해 전체 선택한 뒤 [분류변경](2026-09-06 사용자 설명).
+    """
+
+    def __init__(self, folders: list, target: str):
+        super().__init__(False, 0, use_http=True)
+        self.folders = folders or []
+        self.target = target
+
+    def run(self):
+        try:
+            client = get_client(self.headless, self.monitor, log=self._log)
+            found = moved = 0
+            for f in self.folders:
+                res = fix10.sweep_soldout(client.session, f, self.target,
+                                          log=self._log)
+                found += res["found"]
+                moved += res["moved"]
+            self.finished.emit({"found": found, "moved": moved,
+                                "target": self.target})
+        except Exception as e:
+            self.failed.emit(str(e))
+
 
 class StatusSyncWorker(BaseWorker):
     """

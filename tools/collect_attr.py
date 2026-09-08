@@ -20,13 +20,19 @@ from app.lohas.session import get_client  # noqa: E402
 LIMIT = next((int(a) for a in sys.argv[1:] if a.isdigit()), 0)
 
 
+FOLDER = ""
+for i, a in enumerate(sys.argv[1:]):
+    if a == "--folder" and i + 2 <= len(sys.argv) - 1:
+        FOLDER = sys.argv[i + 2]
+
+
 def log(m):
     print(m, flush=True)
 
 
 def main():
     db.init_db()
-    folder = db.get_job_folder()
+    folder = FOLDER or db.get_job_folder()
     if not folder:
         log("!! 작업폴더 미지정")
         return 1

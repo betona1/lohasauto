@@ -26,9 +26,10 @@ from .category_fix_page import CategoryFixPage
 from .tag_review_page import TagReviewPage
 from .mini_window import MiniWindow
 from .product_page import ProductPage
-from .workers import (AnalysisWorker, BasicCollectWorker, DumpWorker,
-                      FolderScanWorker, InspectWorker,
-                      LcodeStatusWorker, SampleWorker)
+from .workers import (AiImageWorker, AnalysisWorker, BasicCollectWorker,
+                      DumpWorker, Fix10Worker, FolderScanWorker,
+                      InspectWorker, LcodeStatusWorker, SampleWorker,
+                      SoldoutSweepWorker)
 
 # 메인상품 폴더 = 앞 번호가 51~59 로 시작 (51., 541., 594., 5952., 598. ...)
 MAIN_FOLDER_RE = re.compile(r"^\s*5[1-9]\d*\s*\.")
@@ -177,6 +178,10 @@ class MainWindow(QMainWindow):
 
         self._thread = None
         self._worker = None
+        # AI 이미지 일괄수정은 몇 시간짜리라 **공용 슬롯을 쓰지 않는다**
+        self._ai_thread = None
+        self._ai_worker = None
+        self._ai_prog = None
         self._last_items = []
         self._last_cells = []
         self._last_info_todo = 0
@@ -187,6 +192,12 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._reload_folders()
         self._reload_history()
+        # 켤 때 **작업폴더의 마지막 점검**을 그려둔다. 아무것도 안 그리면
+        # 앞서 본 폴더 숫자가 남아 있는 것처럼 보인다(2026-09-08).
+        try:
+            self.show_folder_scan()
+        except Exception:
+            pass
 
         self._log(f"자체 DB(SQLite) : {config.SQLITE_PATH}")
         self._log(db.mysql_status())
@@ -290,8 +301,16 @@ class MainWindow(QMainWindow):
         a = m.addAction("미니 모드로 전환	Ctrl+M")
         a.setShortcut("Ctrl+M")
         a.triggered.connect(self.to_mini)
+        a = m.addAction("트레이로 내리기	Ctrl+T")
+        a.setShortcut("Ctrl+T")
+        a.triggered.connect(self.to_tray)
 
         m = mb.addMenu("설정(&S)")
+        a = m.addAction("자동점검 폴더 선택...")
+        a.triggered.connect(self.on_pick_monitor_folders)
+        a = m.addAction("품절 이동 폴더 지정...")
+        a.triggered.connect(self.on_set_soldout_folder)
+        m.addSeparator()
         a = m.addAction("접속 환경 점검")
         a.triggered.connect(self._check_env)
         a = m.addAction(".env 열기")
@@ -379,6 +398,27 @@ class MainWindow(QMainWindow):
         self._mini.show()
         self._mini.raise_()
         self.hide()
+
+    def to_tray(self):
+        """
+        창을 감추고 트레이 아이콘만 남긴다. 오늘 작업량이 늘면 트레이가
+        알림을 띄우므로 숫자만 확인하면 된다(2026-09-06 사용자 요청).
+        아이콘을 누르면 다시 큰 창이 열린다.
+        """
+        from .tray import Tray
+
+        if getattr(self, "_tray", None) is None:
+            self._tray = Tray(self)
+        self._tray.show()
+        self._tray.refresh(first=True)
+        if getattr(self, "_mini", None) is not None:
+            self._mini.hide()
+        self.hide()
+        self._tray.showMessage(
+            "트레이 모드", "오늘 작업량이 늘면 여기서 알려드립니다."
+            + chr(10) + "아이콘을 누르면 창이 다시 열립니다.",
+            self._tray.Information if hasattr(self._tray, "Information") else 1,
+            3000)
 
     def to_big(self):
         """큰 창으로 돌아온다."""
@@ -602,6 +642,30 @@ class MainWindow(QMainWindow):
         self.btn_quick.clicked.connect(lambda: self.on_inspect(quick=True))
         top.addWidget(self.btn_quick)
 
+        self.btn_fix10 = QPushButton("🛠 수정 1.0")
+        self.btn_fix10.setMinimumHeight(34)
+        self.btn_fix10.setStyleSheet("font-weight:bold; color:#4527a0;")
+        self.btn_fix10.setToolTip(
+            "작업폴더에서 '정보수정' 이 붙은 광고상품을 찾아 1.0 수정을"
+            + chr(10) + "끝까지 눌러 줍니다(로하스 품단종 처리)."
+            + chr(10) + "정방향·역방향을 동시에 돌려 시간이 절반으로 줍니다."
+            + chr(10) + "묶인 상품이 전부 품절인 LCP 는 건너뜁니다."
+        )
+        self.btn_fix10.clicked.connect(self.on_run_fix10)
+        top.addWidget(self.btn_fix10)
+
+        self.btn_ai_img = QPushButton("🎨 AI 이미지 일괄")
+        self.btn_ai_img.setMinimumHeight(34)
+        self.btn_ai_img.setStyleSheet("font-weight:bold; color:#6a1b9a;")
+        self.btn_ai_img.setToolTip(
+            "폴더의 한 페이지(최대 1,000건)를 AI 이미지 일괄수정에 겁니다."
+            + chr(10) + "작업명과 질의어를 확인하고 [적용하기] 를 누르면"
+            + chr(10) + "로하스에서 이미지 변형 작업이 시작됩니다."
+            + chr(10) + "일괄작업은 1회만 — 앞 작업이 끝나야 다음이 돕니다."
+        )
+        self.btn_ai_img.clicked.connect(self.on_run_ai_image)
+        top.addWidget(self.btn_ai_img)
+
         self.btn_sample = QPushButton("🧪 샘플 1건 분석")
         self.btn_sample.setMinimumHeight(34)
         self.btn_sample.setStyleSheet("font-weight:bold; color:#00838f;")
@@ -644,7 +708,20 @@ class MainWindow(QMainWindow):
 
         # ---- 요약 카드 ----
         cards = QGroupBox("점검 결과")
-        grid = QGridLayout(cards)
+        cbox = QVBoxLayout(cards)
+        # **이 숫자가 어느 폴더 것인지** 를 크게 적는다. 없어서 폴더를 바꾼
+        # 뒤에도 앞 폴더 숫자를 보고 "전부 틀리다" 는 오해가 났다
+        # (2026-09-08 사용자 지적).
+        self.lbl_card_src = QLabel("아직 점검하지 않았습니다.")
+        self.lbl_card_src.setWordWrap(True)
+        self.lbl_card_src.setStyleSheet(
+            "font-size:14px; font-weight:bold; color:#0d47a1;"
+            "background:#e3f2fd; border-radius:6px; padding:7px 10px;")
+        cbox.addWidget(self.lbl_card_src)
+        gw = QWidget()
+        grid = QGridLayout(gw)
+        grid.setContentsMargins(0, 0, 0, 0)
+        cbox.addWidget(gw)
         self.card_target = StatCard("★ 작업대상 (이미지승인완료+정보미작업)", "#2e7d32")
         self.card_target_lcp = StatCard("★ 작업대상 LCP 종수", "#2e7d32")
         self.card_total = StatCard("전체 행(L코드)", "#263238")
@@ -1407,6 +1484,10 @@ class MainWindow(QMainWindow):
         db.set_job_folder(name)
         self._log(f"작업폴더 지정 : {name}")
         self._reload_folders()
+        # 바뀐 폴더의 마지막 점검을 바로 보여준다 - 앞 폴더 숫자가 남아
+        # 있으면 "숫자가 전부 틀리다" 로 보인다(2026-09-08)
+        if not self.show_folder_scan(name):
+            self._log(f"'{name}' 은 점검 기록이 없습니다. 전체 점검을 돌려주세요.")
 
     # ------------------------------------------------------------------ 점검
 
@@ -1497,7 +1578,52 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "점검 완료", chr(10).join(lines))
 
+    def show_folder_scan(self, folder: str = "") -> bool:
+        """
+        그 폴더의 **마지막 점검 결과**를 카드·매트릭스에 그린다.
+
+        폴더를 바꿔도 카드가 그대로여서 앞 폴더 숫자를 보고 있게 되던 것을
+        고친 것이다(2026-09-08 사용자 지적). 기록이 없으면 비운다.
+        """
+        folder = folder or db.get_job_folder()
+        if not folder:
+            return False
+        scan = db.latest_scan(folder)
+        if not scan:
+            self.lbl_card_src.setText(
+                f"[{folder}]  아직 점검한 기록이 없습니다."
+                "   ④ 전체 점검을 눌러주세요.")
+            self.lbl_card_src.setStyleSheet(
+                "font-size:14px; font-weight:bold; padding:7px 10px;"
+                "border-radius:6px; color:#e65100; background:#fff3e0;")
+            for c in (self.card_target, self.card_target_lcp, self.card_total,
+                      self.card_done_total, self.card_img_done,
+                      self.card_img_work, self.card_info_todo):
+                c.set_value("-")
+            self._last_cells, self._last_items = [], []
+            self._render_matrix([])
+            self._render_items()
+            return False
+        self._last_items = db.list_scan_items(scan["id"])
+        self._last_cells = db.list_scan_cells(scan["id"])
+        self._apply_summary(scan)
+        self._render_matrix(self._last_cells)
+        self._render_items()
+        return True
+
     def _apply_summary(self, s_: dict):
+        work = db.get_job_folder() or ""
+        src = s_.get("folder_name") or ""
+        mark = "" if (not work or src == work) else "   ⚠ 작업폴더와 다른 폴더입니다"
+        self.lbl_card_src.setText(
+            f"[{src or '-'}]  {s_.get('scanned_at', '-')} 점검"
+            + ("  ·  빠른 점검(작업대상만)" if s_.get("mode") == "quick" else "")
+            + mark)
+        self.lbl_card_src.setStyleSheet(
+            "font-size:14px; font-weight:bold; padding:7px 10px;"
+            "border-radius:6px;"
+            + ("color:#b71c1c; background:#ffebee;" if mark
+               else "color:#0d47a1; background:#e3f2fd;"))
         if s_.get("mode") != "quick":
             self._last_info_todo = s_.get("info_todo_rows") or 0
         # 빠른 점검은 작업대상 한 칸만 재므로 나머지 합계는 '-' 로 표시한다
@@ -1754,7 +1880,8 @@ class MainWindow(QMainWindow):
     def _start_monitor(self):
         if self._monitor_thread is not None:
             return
-        work = db.get_job_folder()
+        picked = self.monitor_folders()
+        work = picked[0] if picked else ""
         if not work:
             QMessageBox.information(
                 self, "안내",
@@ -1767,7 +1894,7 @@ class MainWindow(QMainWindow):
 
         interval = int(self.spn_interval.currentText())
         worker = MonitorWorker(
-            folder_name=work, interval=interval,
+            folder_name=picked, interval=interval,
             headless=self.chk_headless.isChecked(),
             monitor=self.cmb_monitor.currentData(),
         )
@@ -1776,6 +1903,8 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.log.connect(self._log)
         worker.tick.connect(self._on_monitor_tick)
+        # 걸어둔 AI 이미지 작업이 끝나면 팝업으로 알린다(2026-09-07 사용자)
+        worker.ai_done.connect(self._on_ai_job_done)
         worker.failed.connect(self._on_monitor_failed)
         worker.finished.connect(lambda *_: thread.quit())
         thread.finished.connect(self._on_monitor_thread_done)
@@ -1784,7 +1913,7 @@ class MainWindow(QMainWindow):
         self.lbl_monitor_state.setText("● 실행중")
         self.lbl_monitor_state.setStyleSheet("color:#2e7d32; font-weight:bold;")
         self.lbl_board.setText(f"[{work}] 첫 점검 중...")
-        self._log(f"자동점검 시작 : {work} ({interval}초 주기)")
+        self._log(f"자동점검 시작 : {' / '.join(picked)} ({interval}초 주기)")
         thread.start()
 
     def _stop_monitor(self):
@@ -1942,7 +2071,14 @@ class MainWindow(QMainWindow):
         """주기마다 들어오는 현황을 보드에 그린다."""
         self.lbl_board.setText(self._board_html(st))
 
-        # 카드/매트릭스도 같이 갱신
+        # 카드/매트릭스는 **작업폴더 차례일 때만** 갱신한다.
+        # 폴더를 여럿 돌리면 30초마다 다른 폴더 숫자로 바뀌어 화면이 튄다
+        # (2026-09-08 사용자 지적).
+        work = db.get_job_folder()
+        if work and st.get("folder_name") != work:
+            self._refresh_chart()
+            self._refresh_rate_panel()
+            return
         self._apply_summary(st["_summary"])
         self._last_cells = st["_cells"]
         self._last_items = st["_items"]
@@ -1955,19 +2091,378 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ 상품분석
 
-    def on_run_analysis(self):
-        work = db.get_job_folder()
-        if not work:
+    def on_run_fix10(self):
+        """수정사항 1.0 창을 띄운다 — 바로 실행하거나 요일·시각을 예약한다."""
+        from .fix10_dialog import Fix10Dialog
+
+        Fix10Dialog(self, on_run=self._fix10_start,
+                    on_sweep=self._soldout_sweep).exec()
+
+    def _fix10_start(self, folders=None):
+        folders = [f for f in (folders or [db.get_job_folder()]) if f]
+        if not folders:
             QMessageBox.information(
                 self, "안내",
                 "작업폴더가 지정되지 않았습니다." + chr(10)
                 + "작업리스트에서 폴더를 선택하고 [③ 작업폴더로 지정] 을 눌러주세요.")
             return
+        # 품절부터 정리하고 시작한다. 전상품품절은 1.0 수정이 안 되므로
+        # 먼저 품절 폴더로 넘겨두면 뒤가 깔끔하다(2026-09-06 사용자).
+        if not self._sweep_first(folders):
+            return
+        worker = Fix10Worker(folder_name=folders, both=True)
+        label = (folders[0] if len(folders) == 1
+                 else f"폴더 {len(folders)}개")
+        self._start_worker(worker, self._on_fix10_done,
+                           f"'{label}' 수정사항 1.0 일괄 진행 중...")
+
+    # -------------------------------------------------------- AI 이미지 일괄
+
+    def on_run_ai_image(self):
+        """
+        AI 이미지 일괄수정.
+
+        **이미 돌고 있으면 진행 창을 다시 열어준다.** 예전에는 다시 누르면
+        "이미 실행 중인 작업이 있습니다" 만 떴다(2026-09-07 사용자 지적).
+        """
+        from .ai_image_dialog import AiImageDialog
+        from ..lohas import ai_image, session as ses
+
+        if getattr(self, "_ai_thread", None) is not None:
+            if getattr(self, "_ai_prog", None) is not None:
+                self._ai_prog.show()
+                self._ai_prog.raise_()
+                self._ai_prog.activateWindow()
+            else:
+                QMessageBox.information(
+                    self, "AI 이미지 일괄수정",
+                    "이미 진행 중입니다." + chr(10)
+                    + str(db.ai_job_get()))
+            return
+
+        def read_jobs():
+            return ai_image.jobs(ses.get_client().session)
+
+        AiImageDialog(self, on_run=self._ai_image_start,
+                      jobs=read_jobs).exec()
+
+    def _ai_image_start(self, folder, page_from, page_to, title, query):
+        """
+        AI 작업은 **제 스레드에서 따로 돈다.**
+
+        몇 시간짜리라 공용 작업 슬롯을 쓰면 그동안 점검·상품분석·수정1.0 이
+        전부 "이미 실행 중" 으로 막힌다(2026-09-07 사용자 지적).
+        """
+        from PySide6.QtCore import QThread
+
+        from .ai_image_progress import AiImageProgress
+
+        worker = AiImageWorker(
+            folder_name=folder, page_from=page_from, page_to=page_to,
+            title=title, query=query,
+            headless=self.chk_headless.isChecked(),
+            monitor=self.cmb_monitor.currentData())
+        prog = AiImageProgress(self, on_stop=worker.stop)
+        prog.set_plan(folder, page_from, page_to, query)
+        prog.show()
+
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._log)
+        worker.log.connect(prog.append)
+        worker.stat.connect(prog.on_stat)
+        worker.stat.connect(self._on_ai_stat)
+        worker.finished.connect(self._on_ai_image_done)
+        worker.finished.connect(prog.done_all)
+        worker.failed.connect(lambda m: prog.append(f"!! {m}"))
+        worker.failed.connect(self._on_ai_image_failed)
+        for sig in (worker.finished, worker.failed):
+            sig.connect(lambda *_: thread.quit())
+        thread.finished.connect(self._on_ai_thread_done)
+
+        self._ai_thread, self._ai_worker, self._ai_prog = thread, worker, prog
+        self.btn_ai_img.setText("🎨 AI 이미지 (진행중)")
+        self.btn_ai_img.setStyleSheet(
+            "font-weight:bold; color:#fff; background:#6a1b9a;")
+        self._log(f"[AI이미지] '{folder}' {page_from}~{page_to}페이지 시작")
+        thread.start()
+
+    def _on_ai_stat(self, st: dict):
+        """진행 상태를 버튼에도 적어 어디서든 보이게 한다."""
+        self.btn_ai_img.setText(
+            f"🎨 AI {st.get('page')}p {st.get('state', '')}"[:28])
+
+    def _on_ai_thread_done(self):
+        if getattr(self, "_ai_thread", None) is not None:
+            self._ai_thread.deleteLater()
+        if getattr(self, "_ai_worker", None) is not None:
+            self._ai_worker.deleteLater()
+        self._ai_thread = None
+        self._ai_worker = None
+        self.btn_ai_img.setText("🎨 AI 이미지 일괄")
+        self.btn_ai_img.setStyleSheet("font-weight:bold; color:#6a1b9a;")
+
+    def _on_ai_image_failed(self, msg: str):
+        self._log(f"[AI이미지] 실패 : {msg}")
+        QMessageBox.warning(self, "AI 이미지 일괄수정", msg)
+
+    def _on_ai_image_done(self, res: dict):
+        lines = [
+            f"폴더 : {res.get('folder', '')}",
+            f"페이지 : {res.get('from')} ~ {res.get('to')} "
+            f"({res.get('pages', 0)}회 완료)",
+            f"질의어 : {res.get('query', '')}",
+            f"대상 : {res.get('count', 0):,}건",
+            f"소요 : {res.get('seconds', 0) / 60:.1f}분",
+        ]
+        for r in (res.get("results") or [])[-8:]:
+            j = r.get("job") or {}
+            lines.append(f"  · {r.get('title')} {r.get('count', 0):,}건 "
+                         f"{j.get('상태', '')} {j.get('완료일시') or ''}")
+        QMessageBox.information(self, "AI 이미지 일괄수정 완료",
+                                chr(10).join(lines))
+
+    def _on_ai_job_done(self, rec: dict):
+        """자동점검이 '걸어둔 AI 작업이 끝났다' 고 알려올 때 띄운다."""
+        msg = chr(10).join([
+            f"No.{rec.get('no', '')}  {rec.get('title', '')}",
+            f"폴더 : {rec.get('folder', '')} / {rec.get('page', '')}페이지",
+            f"대상 : {rec.get('count', 0):,}건",
+            f"상태 : {rec.get('state', '')}",
+            f"시작 {rec.get('started') or '-'} ~ 완료 {rec.get('ended') or '-'}",
+        ])
+        self._log(f"[AI이미지] 완료 — {rec.get('title', '')}")
+        tray = getattr(self, "_tray", None)
+        if tray is not None and tray.isVisible():
+            tray.showMessage("AI 이미지 일괄수정 완료", msg,
+                             tray.Information if hasattr(tray, "Information")
+                             else 1, 6000)
+        QMessageBox.information(self, "AI 이미지 일괄수정 완료", msg)
+
+    SETTING_MONITOR = "monitor_folders"
+
+    def monitor_folders(self) -> list:
+        """자동점검이 돌 폴더. 안 골랐으면 작업폴더 하나."""
+        v = db.get_setting(self.SETTING_MONITOR, "")
+        picked = [x for x in v.split("|") if x]
+        master = db.list_master_folders()
+        picked = [f for f in picked if f in master]
+        return picked or [f for f in [db.get_job_folder()] if f]
+
+    def on_pick_monitor_folders(self):
+        """
+        자동점검이 돌 폴더를 고른다. 여럿 고르면 주기마다 번갈아 본다.
+
+        폴더가 늘었는데 작업폴더 하나만 보면 나머지 작업량이 안 잡힌다
+        (2026-09-06 사용자 요청).
+        """
+        from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox,
+                                       QVBoxLayout)
+
+        master = db.list_master_folders()
+        if not master:
+            QMessageBox.information(self, "안내", "작업대상 폴더가 없습니다.")
+            return
+        now = set(self.monitor_folders())
+        dlg = QDialog(self)
+        dlg.setWindowTitle("자동점검 폴더 선택")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("자동점검이 돌 폴더를 고르세요."
+                           + chr(10) + "여럿 고르면 주기마다 번갈아 점검합니다."))
+        boxes = []
+        for f in master:
+            c = QCheckBox(f)
+            c.setChecked(f in now)
+            boxes.append(c)
+            v.addWidget(c)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        picked = [c.text() for c in boxes if c.isChecked()]
+        db.set_setting(self.SETTING_MONITOR, "|".join(picked))
+        QMessageBox.information(
+            self, "저장",
+            ("자동점검 폴더 : " + chr(10) + chr(10).join("  " + f for f in picked))
+            if picked else "고른 폴더가 없어 작업폴더만 점검합니다.")
+
+    def on_set_soldout_folder(self):
+        """
+        전상품품절을 옮길 임의분류를 고른다.
+
+        폴더 이름은 사용자마다 다르다. '품절' 이 든 폴더를 먼저 보여줘
+        고르기 쉽게 한다(2026-09-06 사용자 요청).
+        """
+        from PySide6.QtWidgets import QInputDialog
+        from .fix10_dialog import SETTING_SOLDOUT
+
+        with db.sqlite_conn() as c:
+            allf = [r["name"] for r in c.execute(
+                "SELECT name FROM folder ORDER BY sort_order, name")]
+        hot = [f for f in allf if "품절" in f]
+        items = ["(옮기지 않음)"] + hot + [f for f in allf if f not in hot]
+        cur = db.get_setting(SETTING_SOLDOUT, "")
+        idx = items.index(cur) if cur in items else (1 if hot else 0)
+        msg = ("전상품품절인 광고상품을 어느 임의분류로 넘길까요?" + chr(10)
+               + ("'품절' 이 든 폴더를 위에 뒀습니다: "
+                  + ", ".join(hot) if hot else ""))
+        v, ok = QInputDialog.getItem(self, "품절 이동 폴더 지정", msg,
+                                     items, idx, False)
+        if not ok:
+            return
+        v = "" if v.startswith("(") else v
+        db.set_setting(SETTING_SOLDOUT, v)
+        QMessageBox.information(
+            self, "저장",
+            (f"전상품품절은 '{v}' 로 넘깁니다." if v
+             else "품절 상품을 옮기지 않습니다.")
+            + chr(10) + "로컬 DB 와 서버 DB 양쪽에 저장했습니다.")
+
+    def _sweep_first(self, folders) -> bool:
+        """
+        1.0 을 돌리기 전에 품절부터 찾아 보여주고, 옮길지 물어본다.
+
+        돌려주는 값이 False 면 사용자가 취소한 것이다.
+        """
+        from PySide6.QtWidgets import QApplication
+        from ..lohas import fix10
+        from ..lohas.session import get_client
+        from .fix10_dialog import SETTING_SOLDOUT
+
+        target = db.get_setting(SETTING_SOLDOUT, "")
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            cli = get_client(False, 0, log=self._log)
+            found = []
+            for f in folders:
+                for r in fix10.soldout_rows(cli.session, f):
+                    found.append((f, r))
+        except Exception as e:
+            QMessageBox.warning(self, "품절 조회 실패", str(e)[:200])
+            return True                      # 조회가 안 돼도 본 작업은 진행
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not found:
+            self._log("[품절] 옮길 품절 상품이 없습니다.")
+            return True
+
+        codes = [r["product_code"] for _, r in found]
+        head = chr(10).join(f"  {c}" for c in codes[:15])
+        more = (chr(10) + f"  ... 외 {len(codes) - 15}건") if len(codes) > 15 else ""
+        if not target:
+            QMessageBox.information(
+                self, "품절 상품",
+                f"품절 {len(codes)}건이 있습니다." + chr(10) + head + more
+                + chr(10) + chr(10)
+                + "옮길 폴더가 지정되지 않아 그대로 두고 진행합니다."
+                + chr(10) + "설정 > 품절 이동 폴더 지정 에서 정할 수 있습니다.")
+            return True
+
+        ret = QMessageBox.question(
+            self, "품절 상품 정리",
+            f"품절 {len(codes)}건을 찾았습니다." + chr(10) + head + more
+            + chr(10) + chr(10)
+            + f"'{target}' 로 옮기고 수정 1.0 을 시작할까요?"
+            + chr(10) + "[아니오] 를 누르면 옮기지 않고 바로 시작합니다.",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes)
+        if ret == QMessageBox.Cancel:
+            return False
+        if ret == QMessageBox.Yes:
+            try:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                n = 0
+                for f in folders:
+                    rows = [r for g, r in found if g == f]
+                    if rows:
+                        n += fix10.move_rows(cli.session, rows, target, f,
+                                             log=self._log)
+                self._log(f"[품절] 모두 {n}건을 '{target}' 로 넘겼습니다.")
+            except Exception as e:
+                QMessageBox.warning(self, "품절 이동 실패", str(e)[:200])
+            finally:
+                QApplication.restoreOverrideCursor()
+        return True
+
+    def _soldout_sweep(self, folders, target):
+        """품절 상품을 지정한 폴더로 넘긴다."""
+        worker = SoldoutSweepWorker(folders, target)
+        self._start_worker(
+            worker, self._on_sweep_done,
+            f"품절 상품을 '{target}' 로 넘기는 중...")
+
+    def _on_sweep_done(self, res: dict):
+        QMessageBox.information(
+            self, "품절 처리",
+            f"품절 {res.get('found', 0):,}건 중 "
+            f"{res.get('moved', 0):,}건을 '{res.get('target', '')}' 로 "
+            "넘겼습니다.")
+
+    def _on_fix10_done(self, res: dict):
+        QMessageBox.information(
+            self, "수정사항 1.0", chr(10).join([
+                f"대상 {res.get('total', 0):,}건",
+                f"완료 {res.get('ok', 0):,} / 품절 건너뜀 {res.get('soldout', 0):,}"
+                f" / 실패 {res.get('fail', 0):,}",
+                f"소요 {res.get('seconds', 0) / 60:.1f}분",
+            ]))
+
+    def pick_folders(self, title: str, note: str, preset=None) -> list:
+        """
+        폴더를 골라 받는다(체크박스). 취소하면 빈 목록.
+
+        작업폴더 하나만 돌던 기능들을 폴더가 늘어난 뒤에도 쓰게 하려고
+        만든 공용 고르기 창이다(2026-09-07).
+        """
+        from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox,
+                                       QVBoxLayout)
+
+        master = db.list_master_folders()
+        if not master:
+            QMessageBox.information(self, "안내", "작업대상 폴더가 없습니다.")
+            return []
+        now = set(preset or [f for f in [db.get_job_folder()] if f])
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(note))
+        boxes = []
+        for f in master:
+            c = QCheckBox(f)
+            c.setChecked(f in now)
+            boxes.append(c)
+            v.addWidget(c)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return []
+        return [c.text() for c in boxes if c.isChecked()]
+
+    def on_run_analysis(self):
+        # 폴더가 넷으로 늘어난 뒤로 작업폴더 하나만 분석하면 나머지가
+        # 통째로 빠진다. 어느 폴더를 돌릴지 먼저 고른다(2026-09-07 사용자).
+        picked = self.pick_folders(
+            "ALL 상품분석 폴더 선택",
+            "상품분석을 돌릴 폴더를 고르세요."
+            + chr(10) + "여럿 고르면 위에서부터 차례로 돕니다.")
+        if not picked:
+            return
 
         done = db.done_lcp_set()
         stats = db.analysis_stats()
         msg = [
-            f"작업폴더 : {work}",
+            "폴더 : " + (picked[0] if len(picked) == 1
+                        else f"{len(picked)}개"),
+        ]
+        if len(picked) > 1:
+            msg += ["   " + f for f in picked]
+        msg += [
             "",
             "대상 : 대표이미지 승인완료 + 상품정보 미작업",
             "        (같은 LCP 는 1건만 처리)",
@@ -1987,15 +2482,16 @@ class MainWindow(QMainWindow):
             return
 
         worker = AnalysisWorker(
-            folder_name=work,
+            folder_name=picked,
             batch_size=config.ANALYSIS_BATCH,
             poll_interval=config.ANALYSIS_POLL,
             batch_timeout=config.ANALYSIS_TIMEOUT,
             headless=self.chk_headless.isChecked(),
             monitor=self.cmb_monitor.currentData(),
         )
+        label = picked[0] if len(picked) == 1 else f"폴더 {len(picked)}개"
         self._start_worker(worker, self._on_analysis_done,
-                           f"'{work}' ALL 상품분석 중...")
+                           f"'{label}' ALL 상품분석 중...")
 
     def _on_analysis_done(self, stats: dict):
         self._reload_folders()
