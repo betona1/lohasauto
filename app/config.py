@@ -93,6 +93,92 @@ NAVER_DELAY_MAX = float(_str("DELAY_MAX", "1.2") or 1.2)
 def naver_ready() -> bool:
     return bool(NAVER_CUSTOMER_ID and NAVER_ACCESS_KEY and NAVER_SECRET_KEY)
 
+
+def naver_ad_key(customer=None) -> tuple:
+    """
+    그 광고계정의 (액세스 라이선스, 비밀키).
+
+    **키는 광고계정마다 따로 발급된다.** 한 네이버 아이디가 여러 계정의
+    책임자여도, 다른 계정 번호로 부르면 403 `Auth Failed` 가 온다
+    (2026-09-12 실측: 비트테크노-1·2·3, joys01, 바둑이하우스 전부 403).
+    계정마다 `도구 > API 사용관리` 에서 따로 받아야 한다.
+
+        NAVER_AD_KEY_2568098=<액세스라이선스>
+        NAVER_AD_SECRET_2568098=<비밀키>
+
+    없으면 기본 키(naverapikey/naverpass)를 쓴다.
+    """
+    if customer:
+        a = _str(f"NAVER_AD_KEY_{customer}")
+        s = _str(f"NAVER_AD_SECRET_{customer}")
+        if a and s:
+            return a, s
+    return NAVER_ACCESS_KEY, NAVER_SECRET_KEY
+
+
+def naver_ad_customers() -> list:
+    """읽을 광고계정 번호들 (쉼표로 여럿).
+
+    **키 하나로 여러 광고계정을 읽는다.** X-Customer 만 바꾸면 된다 —
+    2026-09-11 실측에서 같은 키로 2718735(3캠페인)·4464788(10캠페인)이
+    모두 200 이었다. 비워두면 NAVER_CUSTOMER_ID 하나만 본다.
+    """
+    ids = [a["customer"] for a in naver_ad_accounts()]
+    if ids:
+        return ids
+    raw = _str("NAVER_AD_CUSTOMERS")
+    ids = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+    return ids or ([NAVER_CUSTOMER_ID] if NAVER_CUSTOMER_ID else [])
+
+
+def naver_ad_accounts() -> list:
+    """
+    `.env` 의 NAVER_AD_CID_n / NAVER_AD_NAME_n 짝. 채운 줄만 읽는다.
+
+    광고주센터 계정 목록의 괄호 숫자는 **화면 표시용이라 API 에 안 먹는다.**
+    각 계정 [도구 > API 사용관리] 에 적힌 CUSTOMER_ID 를 써야 한다
+    (2026-09-12: 비트테크노-1 은 목록엔 2568098 이지만 실제는 4464779).
+    """
+    out = []
+    for i in range(1, 21):
+        cid = _str(f"NAVER_AD_CID_{i}")
+        if not cid:
+            continue
+        out.append({"customer": cid,
+                    "label": _str(f"NAVER_AD_NAME_{i}") or cid})
+    return out
+
+
+# ---- 메일함 (스마트스토어 경고 · 광고비 알림 수신) ----
+# MAIL_1_* ~ MAIL_9_* 를 번호 순서대로 읽는다. 비어 있으면 거기서 멈춘다.
+#   MAIL_1_NAME  표시용 이름
+#   MAIL_1_HOST  imap.naver.com / imap.nate.com
+#   MAIL_1_PORT  993 (IMAP SSL) / 995 (POP3 SSL)
+#   MAIL_1_PROTO imap | pop3       ※ 네이트는 POP3 를 영구 종료했다
+#   MAIL_1_USER  netkjy@naver.com  (네이버는 @앞 아이디만 써도 된다)
+#   MAIL_1_PASS  **2단계 인증을 쓰면 애플리케이션 비밀번호**
+def mailboxes() -> list:
+    out = []
+    for i in range(1, 10):
+        host = _str(f"MAIL_{i}_HOST")
+        user = _str(f"MAIL_{i}_USER")
+        if not host or not user:
+            continue
+        proto = (_str(f"MAIL_{i}_PROTO", "imap") or "imap").lower()
+        out.append({
+            "name": _str(f"MAIL_{i}_NAME") or user,
+            "host": host,
+            "port": _int(f"MAIL_{i}_PORT", 993 if proto == "imap" else 995),
+            "proto": proto,
+            "user": user,
+            "password": _str(f"MAIL_{i}_PASS"),
+            "folder": _str(f"MAIL_{i}_FOLDER", "INBOX") or "INBOX",
+        })
+    return out
+
+
+MAIL_DAYS = _int("MAIL_DAYS", 14)        # 몇 일치를 훑을지
+
 # ---- SQLite ----
 _sqlite_raw = _str("SQLITE_PATH", "data/lohasauto.db")
 SQLITE_PATH = Path(_sqlite_raw)

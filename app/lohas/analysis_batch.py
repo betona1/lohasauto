@@ -6,7 +6,7 @@ ALL 상품분석 (일괄 실행).
 그래서 팝업창을 20개씩 띄우는 대신 HTTP 로 요청만 걸고 바로 다음 상품으로 넘어간다.
 
 동작
-  1) 작업폴더에서 '대표이미지 승인완료 + 상품정보 미작업' 검색
+  1) 작업폴더 **전체**를 검색 (이미지 작업 여부와 상관없이 미리 해둔다)
   2) 같은 LCP 가 최대 20행까지 있으므로 LCP 당 1건만 남긴다
   3) 이미 분석한 LCP 는 DB 기록으로 스킵
   4) batch_size 건씩:
@@ -15,16 +15,69 @@ ALL 상품분석 (일괄 실행).
        - 배치를 다 건 뒤 완료될 때까지 폴링
   5) 완료 즉시 on_record 로 DB/로컬에 최신화 -> 다음 실행 때 다시 안 누른다
 """
+import json
+import os
 import time
 
 from . import constants as C
+
+# 한 번에 한 폴더(계정)만 돈다. GUI 와 CLI 가 따로 돌아 같은 계정을 두 번
+# 두드리는 일을 막는다 (2026-09-08 사용자 지시). 표식은 app_setting 에 둬
+# 프로세스가 달라도 서로 본다. 10분 넘게 갱신이 없으면 죽은 것으로 본다.
+LOCK_KEY = "analysis_running"
+LOCK_STALE_SEC = 600
+
+
+def running_now() -> dict:
+    """지금 돌고 있는 분석. 없으면 {}."""
+    from .. import db as _db
+    try:
+        raw = _db.get_setting(LOCK_KEY, "")
+        if not raw:
+            return {}
+        d = json.loads(raw)
+        if time.time() - float(d.get("beat") or 0) > LOCK_STALE_SEC:
+            return {}                     # 죽은 표식
+        if d.get("pid") == os.getpid():
+            return {}                     # 내 것은 막지 않는다
+        return d
+    except Exception:
+        return {}
+
+
+def _beat(folder: str, done: int = 0, total: int = 0) -> None:
+    from .. import db as _db
+    try:
+        _db.set_setting(LOCK_KEY, json.dumps(
+            {"folder": folder, "pid": os.getpid(), "beat": time.time(),
+             "done": done, "total": total}, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _unlock() -> None:
+    from .. import db as _db
+    try:
+        raw = _db.get_setting(LOCK_KEY, "")
+        if raw and json.loads(raw).get("pid") == os.getpid():
+            _db.set_setting(LOCK_KEY, "")
+    except Exception:
+        pass
 from .analysis import check_analysis, fetch_popup, start_analysis
 
 
 def collect_targets(client, folder_name: str, done_lcps: set, log=print,
-                    queue: list = None) -> dict:
+                    queue: list = None, target_only: bool = False) -> dict:
     """
     작업폴더의 분석 대상(LCP 단위, 기존 완료분 제외)을 만든다.
+
+    **폴더 전체에서 찾는다.** 예전에는 작업대상(대표이미지 승인완료 + 상품정보
+    미작업)만 봤는데, 상품분석은 이미지 작업과 상관없이 미리 해두면 되는
+    선행 단계다. 그렇게 좁혀보다 595 폴더에서 696종 중 606종이 통째로
+    빠져 있었다 (2026-09-08 사용자 지시: "그냥 전체에서 검색해서 눌러주는걸로
+    루틴을 바꾸자").
+
+    target_only=True 로 예전 방식(작업대상만)으로 되돌릴 수 있다.
 
     queue 가 주어지면(자동점검이 저장해둔 미분석 LCP 목록) 검색을 생략하고
     그 목록을 그대로 쓴다 - ALL 상품분석이 곧바로 시작된다.
@@ -38,7 +91,11 @@ def collect_targets(client, folder_name: str, done_lcps: set, log=print,
         log(f"[분석] 저장된 미분석 대기열 사용 → 대상 {len(todo):,}종 (검색 생략)")
         return {"rows": 0, "lcps": len(queue), "skipped": 0, "todo": todo}
 
-    res = client.search_full(folder_name, C.TARGET_IMAGE_VALUE, C.TARGET_INFO_VALUE)
+    if target_only:
+        res = client.search_full(folder_name, C.TARGET_IMAGE_VALUE,
+                                 C.TARGET_INFO_VALUE)
+    else:
+        res = client.search_full(folder_name, "all", "all")
     rows = res["rows"]
 
     by_lcp = {}
@@ -68,11 +125,32 @@ def run_all_analysis(client, folder_name: str, done_lcps: set,
                      batch_size: int = 20, poll_interval: int = 10,
                      batch_timeout: int = 300, log=print, progress=None,
                      should_stop=None, on_record=None, limit: int = 0,
-                     on_stat=None, queue: list = None) -> dict:
+                     on_stat=None, queue: list = None,
+                     target_only: bool = False) -> dict:
     """ALL 상품분석 실행. limit>0 이면 앞에서 그만큼만(시험용). 반환: 통계 dict"""
+    try:
+        return _run_all(client, folder_name, done_lcps, batch_size,
+                        poll_interval, batch_timeout, log, progress,
+                        should_stop, on_record, limit, on_stat, queue,
+                        target_only)
+    finally:
+        _unlock()
+
+
+def _run_all(client, folder_name, done_lcps, batch_size, poll_interval,
+             batch_timeout, log, progress, should_stop, on_record, limit,
+             on_stat, queue, target_only):
     started = time.time()
+    busy = running_now()
+    if busy:
+        msg = (f"이미 '{busy.get('folder')}' 를 분석하는 중입니다 "
+               f"({busy.get('done', 0)}/{busy.get('total', 0)}). "
+               f"끝난 뒤에 하세요.")
+        log(f"[분석] {msg}")
+        raise RuntimeError(msg)
+    _beat(folder_name)
     info = collect_targets(client, folder_name, done_lcps, log=log,
-                           queue=queue)
+                           queue=queue, target_only=target_only)
     todo = info["todo"]
     if limit and limit > 0:
         todo = todo[:limit]
@@ -92,6 +170,7 @@ def run_all_analysis(client, folder_name: str, done_lcps: set,
     def step():
         nonlocal processed
         processed += 1
+        _beat(folder_name, processed, len(todo))
         if progress:
             progress(processed, len(todo))
         if on_stat:

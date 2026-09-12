@@ -21,15 +21,16 @@ from ..lohas.monitors import list_monitors
 from .monitor_worker import MonitorWorker
 from .category_page import CategoryPage
 from .category_review_page import CategoryReviewPage
+from .ad_page import AdPage
 from .todo_page import TodoPage
 from .category_fix_page import CategoryFixPage
 from .tag_review_page import TagReviewPage
 from .mini_window import MiniWindow
 from .product_page import ProductPage
-from .workers import (AiImageWorker, AnalysisWorker, BasicCollectWorker,
-                      DumpWorker, Fix10Worker, FolderScanWorker,
-                      InspectWorker, LcodeStatusWorker, SampleWorker,
-                      SoldoutSweepWorker)
+from .workers import (AdSpendWorker, AiImageWorker, OrderWatchWorker, AnalysisWorker, BasicCollectWorker,
+                      CategoryAutoWorker, DumpWorker, Fix10Worker,
+                      FolderScanWorker, InspectWorker, LcodeStatusWorker,
+                      SampleWorker, SoldoutSweepWorker, TagAllWorker)
 
 # 메인상품 폴더 = 앞 번호가 51~59 로 시작 (51., 541., 594., 5952., 598. ...)
 MAIN_FOLDER_RE = re.compile(r"^\s*5[1-9]\d*\s*\.")
@@ -51,8 +52,9 @@ STATUS_COLORS = {
 
 # 상단 탭에는 매일 쓰는 것만 둔다. 검토·수정용은 [검토중] 메뉴로 뺐다
 # (2026-09-05 사용자 요청). 인덱스는 stack 에 넣은 순서와 같아야 한다.
-NAV_TABS = ["대시보드", "상품정보", "미작업목록"]
-NAV_INDEX = {"대시보드": 0, "상품정보": 1, "미작업목록": 4}
+NAV_TABS = ["대시보드", "상품정보", "미작업목록", "광고"]
+NAV_INDEX = {"대시보드": 0, "상품정보": 1, "미작업목록": 4,
+             "광고": 7}
 REVIEW_MENU = [("카테고리", 2), ("카테고리 검토", 3),
                ("카테고리 수정", 5), ("태그 검수", 6)]
 
@@ -73,8 +75,13 @@ class StatCard(QFrame):
 
         self.lbl_title = QLabel(title)
         self.lbl_title.setStyleSheet("color:#57606a; border:none;")
+        # 제목이 길면 줄바꿈해서 **숫자를 밀어내지 않게** 한다. 예전에는
+        # 한 줄로 늘어나 카드가 찌그러지고 값이 잘렸다(2026-09-12).
+        self.lbl_title.setWordWrap(True)
+        self.setMinimumWidth(180)
 
         self.lbl_value = QLabel("-")
+        self.lbl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         f = QFont()
         f.setPointSize(18)
         f.setBold(True)
@@ -187,6 +194,7 @@ class MainWindow(QMainWindow):
         self._last_info_todo = 0
         self._monitor_thread = None
         self._monitor_worker = None
+        self._pending_monitor_restart = False
 
         db.init_db()
         self._build_ui()
@@ -198,6 +206,12 @@ class MainWindow(QMainWindow):
             self.show_folder_scan()
         except Exception:
             pass
+
+        # 새 주문 알림 — 5분마다 커머스 API 로 오늘 주문을 훑는다
+        try:
+            self._start_order_watch()
+        except Exception as e:
+            self._log(f"[주문] 감시 시작 실패 {str(e)[:70]}")
 
         self._log(f"자체 DB(SQLite) : {config.SQLITE_PATH}")
         self._log(db.mysql_status())
@@ -262,14 +276,20 @@ class MainWindow(QMainWindow):
         self.page_tag_review = TagReviewPage(self)
         self.stack.addWidget(self.page_tag_review)  # 6 : 태그 검수
 
+        # 광고 - 계정·캠페인 설정과 지출 집계(LCP별/날짜별).
+        # 대시보드에는 올리지 않는다 (2026-09-11 사용자).
+        self.page_ad = AdPage(self)
+        self.stack.addWidget(self.page_ad)          # 7 : 광고
+
         root.addWidget(self._build_topbar())
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_folder_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 6)
-        splitter.setSizes([560, 800])   # 폴더명이 잘리지 않을 만큼 좌측 확보
+        # 검은 현황판을 뺀 만큼 오른쪽(카드·수치)을 넓게 쓴다.
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        splitter.setSizes([480, 1120])  # 폴더명이 잘리지 않을 만큼만 좌측
         root.addWidget(splitter, 1)
 
         self.lbl_task = QLabel("")
@@ -666,16 +686,6 @@ class MainWindow(QMainWindow):
         self.btn_ai_img.clicked.connect(self.on_run_ai_image)
         top.addWidget(self.btn_ai_img)
 
-        self.btn_sample = QPushButton("🧪 샘플 1건 분석")
-        self.btn_sample.setMinimumHeight(34)
-        self.btn_sample.setStyleSheet("font-weight:bold; color:#00838f;")
-        self.btn_sample.setToolTip(
-            "작업대상 1건을 읽어 태그·상품명으로 무엇을 고를지 계산해 보여줍니다."
-            + chr(10) + "실제 저장은 하지 않습니다. 브라우저도 뜨지 않습니다(HTTP)."
-        )
-        self.btn_sample.clicked.connect(self.on_run_sample)
-        top.addWidget(self.btn_sample)
-
         self.btn_analysis = QPushButton("🔬 ALL 상품분석")
         self.btn_analysis.setMinimumHeight(34)
         self.btn_analysis.setStyleSheet("font-weight:bold; color:#b71c1c;")
@@ -684,8 +694,32 @@ class MainWindow(QMainWindow):
             + chr(10) + "LCP 단위로 골라 상품분석을 실행합니다."
             + chr(10) + "이미 분석한 LCP 는 자동으로 건너뜁니다."
         )
+        self.btn_analysis.setToolTip(
+            "폴더 전체를 훑어 LCP 마다 1건씩 상품분석을 겁니다."
+            + chr(10) + "대표이미지가 아직 안 끝난 것도 포함합니다."
+            + chr(10) + "이미 분석한 LCP 는 자동으로 건너뜁니다.")
         self.btn_analysis.clicked.connect(self.on_run_analysis)
         top.addWidget(self.btn_analysis)
+
+        self.btn_category = QPushButton("🗂 ALL 카테고리")
+        self.btn_category.setMinimumHeight(34)
+        self.btn_category.setStyleSheet("font-weight:bold; color:#00695c;")
+        self.btn_category.setToolTip(
+            "폴더를 골라 카테고리를 끝까지 채웁니다."
+            + chr(10) + "대상은 상품정보 '미작업' 인 것만 (대표이미지 상태 무관)."
+            + chr(10) + "카테고리 저장은 상품정보 상태를 바꾸지 않습니다.")
+        self.btn_category.clicked.connect(self.on_run_category_all)
+        top.addWidget(self.btn_category)
+
+        self.btn_tag_all = QPushButton("🏷 ALL 태그")
+        self.btn_tag_all.setMinimumHeight(34)
+        self.btn_tag_all.setStyleSheet("font-weight:bold; color:#4527a0;")
+        self.btn_tag_all.setToolTip(
+            "폴더를 골라 태그를 끝까지 채웁니다."
+            + chr(10) + "대상은 카테고리 저장 + 상품정보 '미작업' (이미지 상태 무관)."
+            + chr(10) + "태그 저장은 상품정보 상태를 바꾸지 않습니다.")
+        self.btn_tag_all.clicked.connect(self.on_run_tag_all)
+        top.addWidget(self.btn_tag_all)
 
         self.btn_inspect = QPushButton("④ 전체 점검 (12칸)")
         self.btn_inspect.setMinimumHeight(34)
@@ -698,7 +732,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(box)
 
         # ---- 실시간 현황판 ----
+        # 검은 현황판은 화면만 차지하고 카드와 내용이 겹쳐서 숨긴다.
+        # 코드 여기저기서 setText 를 부르므로 위젯 자체는 남겨 둔다
+        # (2026-09-12 사용자: 전체화면에서 숫자가 찌그러진다).
         self.lbl_board = QLabel("자동점검을 시작하면 현황이 여기에 표시됩니다.")
+        self.lbl_board.hide()
         self.lbl_board.setStyleSheet(
             "QLabel { background:#0d1b2a; color:#e0e1dd; border-radius:6px;"
             " padding:12px 16px; font-family:'Consolas','D2Coding',monospace;"
@@ -728,16 +766,57 @@ class MainWindow(QMainWindow):
         self.card_done_total = StatCard("전체 작업완료 (상품정보 저장완료)", "#00695c")
         self.card_img_done = StatCard("대표이미지 승인완료", "#1565c0")
         self.card_img_work = StatCard("대표이미지 작업중(승인전)", "#6a1b9a")
-        self.card_info_todo = StatCard("상품정보 미작업", "#e65100")
+        # 「상품정보 미작업」은 **이미지승인완료 상태에서 미작업**인 것이다.
+        # 대표이미지가 아직 미작업·이미지작업인 것은 여기 안 든다
+        # (2026-09-09 사용자). 예전에는 이미지 상태를 안 가린 전체 미작업
+        # (info_todo_rows)을 보여줘 작업대상 0 인데 21 로 떴다.
+        self.card_info_todo = StatCard(
+            "상품정보 미작업 (이미지승인완료)", "#e65100")
         self.card_today = StatCard("오늘 작업량 (저장완료 기준)", "#c62828")
+        # 광고 — 값은 DB(ad_spend/ad_account)에서 읽는다. 점검과 주기가
+        # 달라서 [광고 새로고침] 이 눌렸을 때만 API 를 부른다
+        # (2026-09-12 사용자: 대시보드에도 띄워달라).
+        self.card_ad_today = StatCard("오늘 광고비", "#ad1457")
+        self.card_ad_sales = StatCard("오늘 전환매출", "#2e7d32")
+        self.card_ad_biz = StatCard("비즈머니 잔액", "#4527a0")
+        # 광고 규모 — 등록만 많고 안 도는 것이 많아 **등록/실제**를 나눈다
+        self.card_ad_lcp = StatCard("광고 LCP", "#00695c")
+        self.card_ad_prod = StatCard("광고 상품(소재)", "#1565c0")
+        self.card_ad_kw = StatCard("유입 검색어", "#6a1b9a")
 
         for i, c in enumerate([
             self.card_target, self.card_target_lcp,
             self.card_total, self.card_done_total,
             self.card_img_done, self.card_img_work,
             self.card_info_todo, self.card_today,
+            self.card_ad_today, self.card_ad_sales, self.card_ad_biz,
+            self.card_ad_lcp, self.card_ad_prod, self.card_ad_kw,
         ]):
-            grid.addWidget(c, i // 4, i % 4)
+            grid.addWidget(c, i // 5, i % 5)
+        # 다섯 칸을 고르게 나눈다. 안 주면 긴 제목이 있는 칸만 넓어진다.
+        for col in range(5):
+            grid.setColumnStretch(col, 1)
+
+        adrow = QHBoxLayout()
+        self.lbl_ad = QLabel("광고 : 아직 받아오지 않았습니다.")
+        self.lbl_ad.setStyleSheet("color:#57606a;")
+        adrow.addWidget(self.lbl_ad, 1)
+        self.btn_ad_stats = QPushButton("📈 광고비 통계")
+        self.btn_ad_stats.setStyleSheet("font-weight:bold; color:#ad1457;")
+        self.btn_ad_stats.setToolTip(
+            "기간별(7·14·21·30일) 그래프·매체별·TOP10·LCP별 매출을"
+            + chr(10) + "한 창에서 봅니다. 엑셀로도 받을 수 있습니다.")
+        self.btn_ad_stats.clicked.connect(self.on_ad_stats)
+        adrow.addWidget(self.btn_ad_stats)
+
+        self.btn_ad_refresh = QPushButton("💰 광고비 새로고침")
+        self.btn_ad_refresh.setToolTip(
+            "켜 둔 광고계정·캠페인의 오늘 지출과 비즈머니 잔액을 받아옵니다."
+            + chr(10) + "읽기 전용입니다 - 광고를 바꾸지 않습니다."
+            + chr(10) + "고르는 것은 「광고」 탭에서 합니다.")
+        self.btn_ad_refresh.clicked.connect(self.on_refresh_ad)
+        adrow.addWidget(self.btn_ad_refresh)
+        cbox.addLayout(adrow)
         lay.addWidget(cards)
 
         self.lbl_capped = QLabel("")
@@ -1161,7 +1240,7 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool, label: str = ""):
         for b in (self.btn_scan_folders, self.btn_inspect, self.btn_quick,
-                  self.btn_analysis, self.btn_sample,
+                  self.btn_analysis, self.btn_category,
                   self.page_product.btn_status,
                   self.page_product.btn_basic,
                   self.btn_add_master, self.btn_set_job,
@@ -1171,10 +1250,15 @@ class MainWindow(QMainWindow):
         if busy:
             self.progress.setRange(0, 0)
             self.progress.setFormat(label or "실행 중...")
+            # 앞 작업이 남긴 문구를 지운다. 안 지우면 수정1.0 을 눌렀는데
+            # 상품분석/AI 진행 문구가 그대로 떠 있다(2026-09-08 사용자 지적).
+            self.lbl_task.setText(label or "실행 중...")
+            self.setWindowTitle(f"로하스 오토 - {label or '실행 중'}")
         else:
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.progress.setFormat("대기 중")
+            self.lbl_task.setText("")
             self.setWindowTitle("로하스 오토 - 상품정보관리 폴더 수량 점검")
 
     def _start_worker(self, worker, on_finished, busy_label: str):
@@ -1200,6 +1284,217 @@ class MainWindow(QMainWindow):
         self._thread, self._worker = thread, worker
         self._set_busy(True, busy_label)
         thread.start()
+
+    # ------------------------------------------------------------ 광고비
+    def _refresh_ad_cards(self):
+        """
+        카드 값은 **DB 에서만** 읽는다. 대시보드가 다시 그려질 때마다
+        네이버 API 를 부르면 점검 주기(30초)마다 광고 API 를 두들기게 된다.
+        받아오는 것은 [광고비 새로고침] 과 「광고」 탭이 한다.
+        """
+        try:
+            from ..lohas import ad_account, ad_spend
+            t = ad_spend.today_cost()
+            main = ad_account.main_account()
+        except Exception:
+            return
+        cost = int(t["cost"] or 0)
+        amt = int(t.get("conv_amt") or 0)
+        self.card_ad_today.set_value(f"{cost:,}원")
+        self.card_ad_today.lbl_title.setText(
+            f"오늘 광고비 ({t['day']})"
+            + (f"  ·  클릭 {int(t['clk'] or 0):,}" if t.get("clk") else ""))
+        # **네이버 전환매출은 허수다** — 장바구니 담기가 섞여 있다. 실제
+        # 매출은 주문 DB(joacham.orders_order)에서 가져온다. 2026-09-11 에
+        # 네이버는 66,200원이라 했지만 구매완료는 8,770원뿐이었다
+        # (2026-09-12 사용자: "오늘전환매출 이건 허수잔어").
+        try:
+            from ..lohas import ad_sales
+            sale = ad_sales.today()
+        except Exception:
+            sale = {}
+        amt = int(sale.get("amount") or 0)
+        self.card_ad_sales.set_value(f"{amt:,}원")
+        roas = (amt * 100 // cost) if cost else 0
+        self.card_ad_sales.lbl_title.setText(
+            f"오늘 실매출(커머스)  ·  {int(sale.get('orders') or 0):,}건"
+            + (f"  ·  ROAS {roas:,}%" if cost else "")
+            + (f"   [네이버추정 {int(t.get('conv_amt') or 0):,}]"
+               if int(t.get("conv_amt") or 0) != amt else ""))
+        self.card_ad_sales.lbl_value.setStyleSheet(
+            "border:none; color:"
+            + ("#2e7d32" if roas >= 300 else
+               "#ef6c00" if roas > 0 else "#9e9e9e"))
+        # **메인 계정 하나만** 보여준다. 여러 계정을 더하면 그 숫자가
+        # 무엇인지 알 수 없다 (2026-09-12 사용자).
+        if not main:
+            self.card_ad_biz.set_value("-")
+            self.card_ad_biz.lbl_title.setText("비즈머니 잔액")
+            self.lbl_ad.setText(
+                "광고 : 메인 계정이 없습니다 — 「광고」 탭에서 고르십시오.")
+            return
+        bal = int(main["bizmoney"] or 0)
+        self.card_ad_biz.set_value(f"{bal:,}원")
+        self.card_ad_biz.lbl_title.setText(
+            f"비즈머니 잔액 — {main['label'] or main['customer_id']}"
+            + ("  ·  ⚠ 소진" if bal <= 0 else ""))
+        # 광고 규모 카드 — `ad_creative.summary`
+        try:
+            from ..lohas import ad_creative
+            s = ad_creative.summary(main["customer_id"])
+        except Exception:
+            s = {}
+        if s:
+            self.card_ad_lcp.set_value(f"{s['live_lcp']:,}")
+            self.card_ad_lcp.lbl_title.setText(
+                f"광고 LCP (최근 {s['days']}일 노출)"
+                f"  ·  등록 {s['lcp']:,}  ·  지출 {s['paid_lcp']:,}")
+            self.card_ad_prod.set_value(f"{s['ads']:,}")
+            self.card_ad_prod.lbl_title.setText(
+                f"광고 상품(소재) 등록  ·  노출 {s['live_ads']:,}"
+                + (f"  ·  ⚠ 보류 {s['ads_hold']:,}" if s["ads_hold"] else ""))
+            self.card_ad_kw.set_value(f"{s['queries']:,}")
+            self.card_ad_kw.lbl_title.setText(
+                f"유입 검색어 (최근 {s['days']}일)")
+        self.lbl_ad.setText(
+            f"광고 : {main['label'] or main['customer_id']}"
+            f" ({main['customer_id']})"
+            + (f"   ·  마지막 수집 {t['upd']}" if t.get("upd")
+               else "   ·  아직 지출을 받아오지 않았습니다"))
+
+    def on_ad_stats(self):
+        """광고 성과 보고서 창. 한 번 만들고 다시 쓴다."""
+        from .ad_report_dialog import AdReportDialog
+        if getattr(self, "_ad_report", None) is None:
+            self._ad_report = AdReportDialog(self)
+        else:
+            self._ad_report.refresh()
+        self._ad_report.show()
+        self._ad_report.raise_()
+
+    # ---------------------------------------------------------- 주문 알림
+    def _start_order_watch(self):
+        """
+        새 주문이 들어오면 알린다. **주문은 실시간으로 잡힌다**
+        (2026-09-12 사용자). 5분마다 오늘치를 훑어 늘어난 것만 본다.
+        """
+        from PySide6.QtWidgets import QSystemTrayIcon
+        self._order_ids = set()
+        self._order_first = True
+        try:
+            self._tray = QSystemTrayIcon(self.windowIcon(), self)
+            self._tray.setToolTip("로하스 오토 — 새 주문 알림")
+            self._tray.show()
+        except Exception:
+            self._tray = None
+        self._order_timer = QTimer(self)
+        self._order_timer.timeout.connect(self._check_orders)
+        self._order_timer.start(5 * 60 * 1000)
+        QTimer.singleShot(4000, self._check_orders)
+
+    def _check_orders(self):
+        if getattr(self, "_order_thread", None) is not None:
+            return
+        worker = OrderWatchWorker(getattr(self, "_order_ids", set()))
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_orders)
+        worker.failed.connect(lambda m: self._log(f"[주문] {m[:90]}"))
+        for sig in (worker.finished, worker.failed):
+            sig.connect(lambda *_: thread.quit())
+        thread.finished.connect(self._on_order_thread_done)
+        self._order_thread, self._order_worker = thread, worker
+        thread.start()
+
+    def _on_orders(self, res: dict):
+        if res.get("skip"):
+            return
+        self._order_ids = set(res.get("ids") or ())
+        new = res.get("new") or []
+        # 앱을 막 켰을 때는 **이미 있던 주문으로 알림을 띄우지 않는다.**
+        if self._order_first:
+            self._order_first = False
+            if new:
+                self._log(f"[주문] 오늘 이미 {len(new)}건 들어와 있습니다")
+            self._refresh_ad_cards()
+            return
+        if not new:
+            return
+        amt = sum(x["amount"] for x in new)
+        head = f"새 주문 {len(new)}건 · {amt:,}원"
+        lines = [f"{x['amount']:,}원 x{x['qty']} "
+                 f"{'[광고] ' if x['ad'] else ''}{x['name'][:28]}"
+                 for x in new[:5]]
+        self._log("[주문] " + head)
+        for l in lines:
+            self._log("        " + l)
+        if getattr(self, "_tray", None) is not None:
+            from PySide6.QtWidgets import QSystemTrayIcon
+            self._tray.showMessage(head, chr(10).join(lines),
+                                   QSystemTrayIcon.Information, 12000)
+        try:
+            from ..lohas import commerce
+            r = commerce.sales(res.get("day"), log=lambda *_: None)
+            if r["orders"]:
+                commerce.save(r, log=lambda *_: None)
+        except Exception:
+            pass
+        self._refresh_ad_cards()
+
+    def _on_order_thread_done(self):
+        if getattr(self, "_order_thread", None) is not None:
+            self._order_thread.deleteLater()
+        if getattr(self, "_order_worker", None) is not None:
+            self._order_worker.deleteLater()
+        self._order_thread = None
+        self._order_worker = None
+
+    def on_refresh_ad(self):
+        """오늘 지출과 잔액만 받아온다. 점검 작업과 겹쳐도 되게 별도 슬롯."""
+        from ..lohas import searchad
+        if not searchad.available():
+            QMessageBox.information(
+                self, "광고", ".env 에 네이버 검색광고 API 키가 없습니다.")
+            return
+        if getattr(self, "_ad_thread", None) is not None:
+            QMessageBox.information(self, "광고", "이미 받아오는 중입니다.")
+            return
+        from ..lohas import ad_account
+        base = not ad_account.accounts()      # 처음이면 기본정보부터
+        worker = AdSpendWorker(days=1, base=base)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._log)
+        worker.failed.connect(
+            lambda m: (self._log(f"[광고] {m}"),
+                       self.btn_ad_refresh.setEnabled(True)))
+        worker.finished.connect(self._on_ad_done)
+        for sig in (worker.finished, worker.failed):
+            sig.connect(lambda *_: thread.quit())
+        thread.finished.connect(self._on_ad_thread_done)
+        self._ad_thread, self._ad_worker = thread, worker
+        self.btn_ad_refresh.setEnabled(False)
+        self.btn_ad_refresh.setText("받는 중…")
+        thread.start()
+
+    def _on_ad_done(self, res: dict):
+        self._refresh_ad_cards()
+        if getattr(self, "page_ad", None) is not None:
+            self.page_ad.refresh()
+        self._log(f"[광고] 오늘 지출 {res.get('cost', 0):,}원 "
+                  f"· {res.get('rows', 0):,}행")
+
+    def _on_ad_thread_done(self):
+        if getattr(self, "_ad_thread", None) is not None:
+            self._ad_thread.deleteLater()
+        if getattr(self, "_ad_worker", None) is not None:
+            self._ad_worker.deleteLater()
+        self._ad_thread = None
+        self._ad_worker = None
+        self.btn_ad_refresh.setEnabled(True)
+        self.btn_ad_refresh.setText("💰 광고비 새로고침")
 
     def _on_thread_done(self):
         if self._thread is not None:
@@ -1487,7 +1782,37 @@ class MainWindow(QMainWindow):
         # 바뀐 폴더의 마지막 점검을 바로 보여준다 - 앞 폴더 숫자가 남아
         # 있으면 "숫자가 전부 틀리다" 로 보인다(2026-09-08)
         if not self.show_folder_scan(name):
-            self._log(f"'{name}' 은 점검 기록이 없습니다. 전체 점검을 돌려주세요.")
+            self._log(f"'{name}' 은 점검 기록이 없습니다.")
+        # **자동점검도 바뀐 폴더를 따라간다.** 안 따라가면 작업량(work_log)이
+        # 앞 폴더로만 쌓여 '오늘 작업량' 이 0 으로 보인다 — 엑사로 바꿨는데
+        # 594 를 계속 재고 있었다(2026-09-10 사용자).
+        # 현황판(검은 창)은 자동점검이 그린다. 폴더를 바꾸면 앞 폴더 숫자가
+        # 그대로 남아 헷갈리므로 그 자리에서 비운다(2026-09-10 사용자).
+        self.lbl_board.setText(
+            f"[{name}] 자동점검을 기다리는 중..."
+            if self._monitor_thread is None
+            else f"[{name}] 폴더를 옮기는 중...")
+
+        picked_now = [x for x in db.get_setting(self.SETTING_MONITOR, "").split("|")
+                      if x]
+        if self._monitor_thread is not None and not picked_now:
+            # 자동점검 폴더를 따로 고르지 않았으면 작업폴더를 따라간다.
+            # 골라뒀으면 그 목록이 사용자의 뜻이니 건드리지 않는다.
+            self._log(f"자동점검을 '{name}' 로 옮깁니다")
+            self._pending_monitor_restart = True
+            self._stop_monitor()
+        elif self._monitor_thread is not None and name not in picked_now:
+            self._log(f"※ 자동점검 폴더 목록에 '{name}' 이 없습니다."
+                      " [자동점검 폴더 선택] 에서 넣어야 작업량이 쌓입니다.")
+
+        # **바로 다시 잰다.** HTTP 점검은 5초면 끝나므로 기다릴 것이 없고,
+        # 며칠 전 숫자를 그대로 보여주면 "안 맞는다" 가 된다(2026-09-10).
+        if self._thread is None:
+            self._log(f"'{name}' 최신 상태로 다시 점검합니다...")
+            self.on_inspect(quick=False)
+        else:
+            self._log("다른 작업이 도는 중이라 점검은 건너뜁니다."
+                      " 끝나면 [④ 전체 점검] 을 눌러주세요.")
 
     # ------------------------------------------------------------------ 점검
 
@@ -1615,6 +1940,24 @@ class MainWindow(QMainWindow):
         work = db.get_job_folder() or ""
         src = s_.get("folder_name") or ""
         mark = "" if (not work or src == work) else "   ⚠ 작업폴더와 다른 폴더입니다"
+        # **언제 잰 숫자인지 밝힌다.** 폴더를 바꾸면 그 폴더의 마지막 점검을
+        # 보여주는데, 그게 며칠 전 것이면 "숫자가 안 맞는다" 가 된다 —
+        # 엑사로 바꾸니 이틀 전 기록(승인완료 43)이 떴고 실제는 989였다
+        # (2026-09-10 사용자).
+        age = ""
+        try:
+            import datetime as _dt
+            t = _dt.datetime.strptime(str(s_.get("scanned_at") or ""),
+                                      "%Y-%m-%d %H:%M:%S")
+            m = (_dt.datetime.now() - t).total_seconds() / 60
+            if m >= 60 * 24:
+                age = f"   ⚠ {int(m // (60 * 24))}일 전 기록입니다"
+            elif m >= 30:
+                age = f"   ⚠ {int(m // 60)}시간 {int(m % 60)}분 전 기록입니다"
+        except Exception:
+            pass
+        if age:
+            mark += age
         self.lbl_card_src.setText(
             f"[{src or '-'}]  {s_.get('scanned_at', '-')} 점검"
             + ("  ·  빠른 점검(작업대상만)" if s_.get("mode") == "quick" else "")
@@ -1625,7 +1968,8 @@ class MainWindow(QMainWindow):
             + ("color:#b71c1c; background:#ffebee;" if mark
                else "color:#0d47a1; background:#e3f2fd;"))
         if s_.get("mode") != "quick":
-            self._last_info_todo = s_.get("info_todo_rows") or 0
+            # '남은 N개' 도 실제로 지금 할 수 있는 것 = 작업대상이다
+            self._last_info_todo = s_.get("target_rows") or 0
         # 빠른 점검은 작업대상 한 칸만 재므로 나머지 합계는 '-' 로 표시한다
         quick = (s_.get("mode") == "quick")
 
@@ -1637,7 +1981,14 @@ class MainWindow(QMainWindow):
         self.card_total.set_value(val("total_rows"))
         self.card_img_done.set_value(val("img_done_rows"))
         self.card_img_work.set_value(val("img_work_rows"))
-        self.card_info_todo.set_value(val("info_todo_rows"))
+        self.card_info_todo.set_value(f"{s_['target_rows']:,}")
+        # 이미지가 아직 안 끝나 작업대상에 못 드는 미작업도 같이 알려준다.
+        # 숫자가 사라지면 "어디 갔냐" 가 되므로 부제로 남긴다.
+        not_ready = 0 if quick else max(
+            0, (s_.get("info_todo_rows") or 0) - (s_.get("target_rows") or 0))
+        self.card_info_todo.lbl_title.setText(
+            "상품정보 미작업 (이미지승인완료)"
+            + (f"   ·  이미지 미완료 {not_ready:,}" if not_ready else ""))
         self.card_done_total.set_value(val("info_save_rows"))
 
         # 오늘 작업량 (기준행 이후 실제 증가분)
@@ -1650,6 +2001,7 @@ class MainWindow(QMainWindow):
                 + (f" · 분석 {t['analyzed']:,}" if t["analyzed"] else ""))
         except Exception:
             self.card_today.set_value("-")
+        self._refresh_ad_cards()   # 광고비 카드 (DB 에서만 읽는다)
         self._sync_mini()          # 작은 창을 띄워둔 채여도 숫자가 맞게
         if s_.get("capped"):
             self.lbl_capped.setText(
@@ -1936,6 +2288,13 @@ class MainWindow(QMainWindow):
         self.chk_monitor.blockSignals(True)
         self.chk_monitor.setChecked(False)
         self.chk_monitor.blockSignals(False)
+        # 폴더를 바꾸느라 멈춘 것이면 새 폴더로 다시 켠다
+        if getattr(self, "_pending_monitor_restart", False):
+            self._pending_monitor_restart = False
+            self.chk_monitor.blockSignals(True)
+            self.chk_monitor.setChecked(True)
+            self.chk_monitor.blockSignals(False)
+            self._start_monitor()
 
     def _on_monitor_failed(self, msg: str):
         self._log(f"[모니터 오류] {msg}")
@@ -2018,13 +2377,23 @@ class MainWindow(QMainWindow):
         rows.append("<tr><td colspan='3'><hr style='border:0; "
                     "border-top:1px solid #2c3e50;'></td></tr>")
 
-        # 상품정보 미완료 / 미분석
+        # 상품정보 미작업 / 미분석
+        #
+        # **이미지승인완료 상태에서 미작업인 것**만 센다(= target_rows).
+        # 대표이미지가 아직 미작업·이미지작업인 것은 지금 할 수 없는 일이라
+        # 여기 들면 안 된다 — 작업대상 0 인데 21 로 떠 헷갈렸다
+        # (2026-09-09 사용자).
+        _todo = st.get("target_rows", st.get("info_todo_rows", 0)) or 0
+        _later = max(0, (st.get("info_todo_rows") or 0) - _todo)
         rows.append(
             f"<tr><td style='padding:2px 12px 2px 6px; color:#b0bec5;'>"
-            f"상품정보 미완료</td>"
+            f"상품정보 미작업</td>"
             f"<td align='right' style='padding:2px 6px;'>"
-            f"{big(st['info_todo_rows'], '#ff8a65')}</td>"
-            f"<td style='padding:2px 6px; color:#78909c;'>개</td></tr>")
+            f"{big(_todo, '#ff8a65')}</td>"
+            f"<td style='padding:2px 6px; color:#78909c;'>개"
+            + (f" &nbsp;&nbsp;(이미지 미완료 {_later:,}개는 제외)"
+               if _later else "")
+            + f"</td></tr>")
         rows.append(
             f"<tr><td style='padding:2px 12px 2px 6px; color:#b0bec5;'>"
             f"미완료중 미분석LCP</td>"
@@ -2041,7 +2410,7 @@ class MainWindow(QMainWindow):
                     "border-top:1px solid #2c3e50;'></td></tr>")
         rows.append(
             f"<tr><td style='padding:2px 12px 2px 6px; color:#b0bec5;'>"
-            f"남은 {st['info_todo_rows']:,}개 예상</td>"
+            f"남은 {_todo:,}개 예상</td>"
             f"<td colspan='2' style='padding:2px 6px;'>"
             f"<b style='color:#ffd54f; font-size:14px;'>"
             f"{self._fmt_eta(st.get('eta_min'))}</b>"
@@ -2445,72 +2814,302 @@ class MainWindow(QMainWindow):
         return [c.text() for c in boxes if c.isChecked()]
 
     def on_run_analysis(self):
-        # 폴더가 넷으로 늘어난 뒤로 작업폴더 하나만 분석하면 나머지가
-        # 통째로 빠진다. 어느 폴더를 돌릴지 먼저 고른다(2026-09-07 사용자).
-        picked = self.pick_folders(
-            "ALL 상품분석 폴더 선택",
-            "상품분석을 돌릴 폴더를 고르세요."
-            + chr(10) + "여럿 고르면 위에서부터 차례로 돕니다.")
-        if not picked:
+        """
+        ALL 상품분석 — 폴더 선택과 진행 상황을 한 창에서 본다.
+
+        **한 번에 한 폴더(계정)만** 돈다. 돌고 있으면 창만 다시 띄워
+        어디까지 갔는지 보여주고, 폴더 선택·시작은 잠긴다
+        (2026-09-08 사용자 지시).
+        """
+        from .analysis_dialog import AnalysisDialog
+
+        dlg = getattr(self, "_an_dlg", None)
+        if dlg is None:
+            dlg = AnalysisDialog(
+                self, self._folders or [],
+                on_start=self._analysis_start,
+                on_stop=lambda: (getattr(self, "_an_worker", None)
+                                 and self._an_worker.stop()))
+            self._an_dlg = dlg
+        if getattr(self, "_an_thread", None) is not None:
+            dlg.mark_running(getattr(self, "_an_folder", ""),
+                             getattr(self, "_an_stat", None) or {})
+        else:
+            # 다른 창·CLI 가 돌고 있으면 그것도 막는다. 표식은 DB 에 있어
+            # 프로세스가 달라도 서로 본다 (2026-09-08).
+            from ..lohas.analysis_batch import running_now
+            busy = running_now()
+            if busy:
+                dlg.mark_external(busy)
+            else:
+                dlg.mark_idle()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _analysis_start(self, folder: str):
+        """
+        분석은 **제 스레드에서 따로 돈다.** 몇 시간짜리라 공용 작업 슬롯을
+        쓰면 그동안 점검·수정1.0 이 전부 '이미 실행 중' 으로 막힌다.
+        """
+        from PySide6.QtCore import QThread
+
+        if getattr(self, "_an_thread", None) is not None:
+            QMessageBox.information(
+                self, "ALL 상품분석",
+                "이미 다른 폴더를 분석 중입니다." + chr(10)
+                + f"'{getattr(self, '_an_folder', '')}' 가 끝난 뒤에 하세요.")
             return
 
-        done = db.done_lcp_set()
-        stats = db.analysis_stats()
-        msg = [
-            "폴더 : " + (picked[0] if len(picked) == 1
-                        else f"{len(picked)}개"),
-        ]
-        if len(picked) > 1:
-            msg += ["   " + f for f in picked]
-        msg += [
-            "",
-            "대상 : 대표이미지 승인완료 + 상품정보 미작업",
-            "        (같은 LCP 는 1건만 처리)",
-            f"이미 분석 기록된 LCP : {len(done):,}종 → 자동 스킵",
-            f"배치 : {config.ANALYSIS_BATCH}건씩 요청 후 완료 대기",
-            "",
-            "실제로 상품분석 작업이 생성됩니다. 진행할까요?",
-        ]
-        if stats:
-            msg.insert(-2, f"기록 상태 : {stats}")
-
-        ret = QMessageBox.question(
-            self, "ALL 상품분석", chr(10).join(msg),
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if ret != QMessageBox.Yes:
-            return
-
+        dlg = self._an_dlg
         worker = AnalysisWorker(
-            folder_name=picked,
+            folder_name=folder,
             batch_size=config.ANALYSIS_BATCH,
             poll_interval=config.ANALYSIS_POLL,
             batch_timeout=config.ANALYSIS_TIMEOUT,
             headless=self.chk_headless.isChecked(),
             monitor=self.cmb_monitor.currentData(),
         )
-        label = picked[0] if len(picked) == 1 else f"폴더 {len(picked)}개"
-        self._start_worker(worker, self._on_analysis_done,
-                           f"'{label}' ALL 상품분석 중...")
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._log)
+        worker.log.connect(dlg.append)
+        worker.progress.connect(dlg.on_progress)
+        worker.stat.connect(self._on_an_stat)
+        worker.stat.connect(dlg.on_stat)
+        worker.finished.connect(self._on_analysis_done)
+        worker.finished.connect(dlg.done_all)
+        worker.failed.connect(lambda m: dlg.append(f"!! {m}"))
+        worker.failed.connect(self._on_failed)
+        for sig in (worker.finished, worker.failed):
+            sig.connect(lambda *_: thread.quit())
+        thread.finished.connect(self._on_an_thread_done)
+
+        self._an_thread, self._an_worker = thread, worker
+        self._an_folder, self._an_stat = folder, {}
+        dlg.mark_running(folder, {})
+        self.btn_analysis.setText("🔬 상품분석 (진행중)")
+        self.btn_analysis.setStyleSheet(
+            "font-weight:bold; color:#fff; background:#ef6c00;")
+        self._log(f"[상품분석] '{folder}' 시작")
+        thread.start()
+
+    def _on_an_stat(self, st: dict):
+        """진행 상태를 버튼에도 적어 창을 닫아도 보이게 한다."""
+        self._an_stat = st
+        d, t = st.get("processed", 0), st.get("total", 0)
+        if t:
+            self.btn_analysis.setText(f"🔬 상품분석 {d:,}/{t:,}")
+
+    # -------------------------------------------------------- ALL 카테고리
+    def on_run_category_all(self):
+        """
+        폴더를 골라 카테고리를 끝까지 채운다. 상품분석과 같은 규칙이다 —
+        한 번에 한 폴더, 창을 닫아도 계속 (2026-09-09 사용자 지시).
+        """
+        from .category_dialog import CategoryDialog
+
+        def count(folder):
+            from ..lohas import category_plan as cp
+            g = cp.pending(db, folder, todo_only=True)
+            return len(g), sum(len(v) for v in g.values())
+
+        dlg = getattr(self, "_cat_dlg", None)
+        if dlg is None:
+            dlg = CategoryDialog(
+                self, self._folders or [], counter=count,
+                on_start=self._category_all_start,
+                on_stop=lambda: (getattr(self, "_cat_worker", None)
+                                 and self._cat_worker.stop()))
+            self._cat_dlg = dlg
+        if getattr(self, "_cat_thread", None) is not None:
+            dlg.mark_running(getattr(self, "_cat_folder", ""),
+                             getattr(self, "_cat_stat", None) or {})
+        else:
+            dlg.mark_idle()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _category_all_start(self, folder: str):
+        from PySide6.QtCore import QThread
+
+        if getattr(self, "_cat_thread", None) is not None:
+            QMessageBox.information(
+                self, "ALL 카테고리",
+                "이미 다른 폴더를 처리 중입니다." + chr(10)
+                + f"'{getattr(self, '_cat_folder', '')}' 가 끝난 뒤에 하세요.")
+            return
+        dlg = self._cat_dlg
+        worker = CategoryAutoWorker(
+            folder_name=folder,
+            headless=self.chk_headless.isChecked(),
+            monitor=self.cmb_monitor.currentData())
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._log)
+        worker.log.connect(dlg.append)
+        worker.progress.connect(dlg.on_progress)
+        worker.stat.connect(self._on_cat_stat)
+        worker.stat.connect(dlg.on_stat)
+        worker.finished.connect(self._on_category_all_done)
+        worker.finished.connect(dlg.done_all)
+        worker.failed.connect(lambda m: dlg.append(f"!! {m}"))
+        worker.failed.connect(self._on_failed)
+        for sig in (worker.finished, worker.failed):
+            sig.connect(lambda *_: thread.quit())
+        thread.finished.connect(self._on_cat_thread_done)
+
+        self._cat_thread, self._cat_worker = thread, worker
+        self._cat_folder, self._cat_stat = folder, {}
+        dlg.mark_running(folder, {})
+        self.btn_category.setText("🗂 카테고리 (진행중)")
+        self.btn_category.setStyleSheet(
+            "font-weight:bold; color:#fff; background:#00695c;")
+        self._log(f"[카테고리] '{folder}' 시작")
+        thread.start()
+
+    def _on_cat_stat(self, st: dict):
+        self._cat_stat = st
+        d, t = st.get("processed", 0), st.get("total", 0)
+        if t:
+            self.btn_category.setText(
+                f"🗂 {st.get('phase', '카테고리')} {d:,}/{t:,}"[:26])
+
+    def _on_category_all_done(self, res: dict):
+        self._reload_folders()
+        self._log(
+            f"[카테고리] 완료 — LCP {res.get('lcps', 0):,}종 / "
+            f"저장 {res.get('ok', 0):,}건 · 실패 {res.get('fail', 0):,}건")
+
+    # ------------------------------------------------------------ ALL 태그
+    def on_run_tag_all(self):
+        from .tag_dialog import TagDialog
+
+        def count(folder):
+            from ..lohas import tag_batch
+            g = tag_batch.targets(db, folder)
+            return len(g), sum(len(v) for v in g.values())
+
+        dlg = getattr(self, "_tag_dlg", None)
+        if dlg is None:
+            dlg = TagDialog(
+                self, self._folders or [], counter=count,
+                on_start=self._tag_all_start,
+                on_stop=lambda: (getattr(self, "_tag_worker", None)
+                                 and self._tag_worker.stop()))
+            self._tag_dlg = dlg
+        if getattr(self, "_tag_thread", None) is not None:
+            dlg.mark_running(getattr(self, "_tag_folder", ""),
+                             getattr(self, "_tag_stat", None) or {})
+        else:
+            dlg.mark_idle()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _tag_all_start(self, folder: str):
+        from PySide6.QtCore import QThread
+
+        if getattr(self, "_tag_thread", None) is not None:
+            QMessageBox.information(
+                self, "ALL 태그",
+                "이미 다른 폴더를 처리 중입니다." + chr(10)
+                + f"'{getattr(self, '_tag_folder', '')}' 가 끝난 뒤에 하세요.")
+            return
+        dlg = self._tag_dlg
+        worker = TagAllWorker(
+            folder_name=folder,
+            headless=self.chk_headless.isChecked(),
+            monitor=self.cmb_monitor.currentData())
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._log)
+        worker.log.connect(dlg.append)
+        worker.progress.connect(dlg.on_progress)
+        worker.stat.connect(self._on_tag_stat)
+        worker.stat.connect(dlg.on_stat)
+        worker.finished.connect(self._on_tag_all_done)
+        worker.finished.connect(dlg.done_all)
+        worker.failed.connect(lambda m: dlg.append(f"!! {m}"))
+        worker.failed.connect(self._on_failed)
+        for sig in (worker.finished, worker.failed):
+            sig.connect(lambda *_: thread.quit())
+        thread.finished.connect(self._on_tag_thread_done)
+
+        self._tag_thread, self._tag_worker = thread, worker
+        self._tag_folder, self._tag_stat = folder, {}
+        dlg.mark_running(folder, {})
+        self.btn_tag_all.setText("🏷 태그 (진행중)")
+        self.btn_tag_all.setStyleSheet(
+            "font-weight:bold; color:#fff; background:#4527a0;")
+        self._log(f"[태그] '{folder}' 시작")
+        thread.start()
+
+    def _on_tag_stat(self, st: dict):
+        self._tag_stat = st
+        d, t = st.get("processed", 0), st.get("total", 0)
+        if t:
+            self.btn_tag_all.setText(f"🏷 태그 {d:,}/{t:,}")
+
+    def _on_tag_all_done(self, res: dict):
+        self._log(f"[태그] 완료 — 묶음 {res.get('groups', 0):,}개 / "
+                  f"저장 {res.get('ok', 0):,}건 · 실패 {res.get('fail', 0):,}건")
+
+    def _on_tag_thread_done(self):
+        if getattr(self, "_tag_thread", None) is not None:
+            self._tag_thread.deleteLater()
+        if getattr(self, "_tag_worker", None) is not None:
+            self._tag_worker.deleteLater()
+        self._tag_thread = None
+        self._tag_worker = None
+        self._tag_folder = ""
+        if getattr(self, "_tag_dlg", None) is not None:
+            self._tag_dlg.mark_idle()
+        self.btn_tag_all.setText("🏷 ALL 태그")
+        self.btn_tag_all.setStyleSheet("font-weight:bold; color:#4527a0;")
+
+    def _on_cat_thread_done(self):
+        if getattr(self, "_cat_thread", None) is not None:
+            self._cat_thread.deleteLater()
+        if getattr(self, "_cat_worker", None) is not None:
+            self._cat_worker.deleteLater()
+        self._cat_thread = None
+        self._cat_worker = None
+        self._cat_folder = ""
+        if getattr(self, "_cat_dlg", None) is not None:
+            self._cat_dlg.mark_idle()
+        self.btn_category.setText("🗂 ALL 카테고리")
+        self.btn_category.setStyleSheet("font-weight:bold; color:#00695c;")
+
+    def _on_an_thread_done(self):
+        if getattr(self, "_an_thread", None) is not None:
+            self._an_thread.deleteLater()
+        if getattr(self, "_an_worker", None) is not None:
+            self._an_worker.deleteLater()
+        self._an_thread = None
+        self._an_worker = None
+        self._an_folder = ""
+        if getattr(self, "_an_dlg", None) is not None:
+            self._an_dlg.mark_idle()
+        self.btn_analysis.setText("🔬 ALL 상품분석")
+        self.btn_analysis.setStyleSheet("font-weight:bold; color:#ef6c00;")
 
     def _on_analysis_done(self, stats: dict):
+        # 결과는 진행 창이 그대로 보여준다. 팝업으로 또 막지 않는다 —
+        # 창을 닫아두고 다른 일을 하다가 갑자기 튀어나오면 방해가 된다
+        # (2026-09-08).
         self._reload_folders()
-        lines = [
-            f"검색 {stats.get('rows', 0):,}행 → LCP {stats.get('lcps', 0):,}종",
-            f"기존 완료 스킵 : {stats.get('skipped', 0):,}종",
-            "─" * 30,
-            f"분석 대상 : {stats.get('total', 0):,}종",
-            f"   완료      : {stats.get('done', 0):,}",
-            f"   이미완료  : {stats.get('already', 0):,}",
-            f"   오류      : {stats.get('error', 0):,}",
-            f"   시간초과  : {stats.get('timeout', 0):,}",
-            "",
-            f"소요 : {stats.get('elapsed', 0)}초",
-            "",
-            "완료된 LCP 는 DB와 로컬파일에 기록되어",
-            "다음 실행 때 다시 분석하지 않습니다.",
-        ]
-        QMessageBox.information(self, "ALL 상품분석 완료", chr(10).join(lines))
+        self._log(
+            f"[상품분석] 완료 — 대상 {stats.get('total', 0):,}종 / "
+            f"완료 {stats.get('done', 0):,} · "
+            f"이미완료 {stats.get('already', 0):,} · "
+            f"오류 {stats.get('error', 0):,} · "
+            f"시간초과 {stats.get('timeout', 0):,} · "
+            f"{stats.get('elapsed', 0)}초")
 
     # ------------------------------------------------------------------ 덤프
 

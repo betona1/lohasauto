@@ -552,6 +552,159 @@ class CategorySaveWorker(BaseWorker):
             self.failed.emit(str(e))
 
 
+class CategoryAutoWorker(BaseWorker):
+    """
+    **ALL 카테고리** — 폴더 하나의 카테고리를 끝까지 채운다.
+
+    대상은 **상품정보가 '미작업' 인 것만**이고, 대표이미지 상태는 가리지
+    않는다. 카테고리는 이미지 작업과 상관없는 선행 단계이기 때문이다
+    (2026-09-09 사용자 지시).
+
+    순서
+      1) 필요하면 attr 팝업을 다시 읽어 `next_step` 을 최신으로 만든다.
+         분석을 막 끝낸 폴더는 이게 없으면 대상이 0건으로 나온다.
+      2) LCP 마다 후보를 조회해 등급을 매기고(`category_plan.build`)
+      3) 등급별로 한 코드를 정해(`auto_choice`) 저장한다
+      4) 저장분을 되읽어 실제로 들어갔는지 확인한다
+
+    **상품정보 상태는 바뀌지 않는다** — 카테고리 저장은 태그·상품명 저장과
+    달리 '저장완료' 로 넘기지 않는다.
+    """
+
+    def __init__(self, folder_name: str, refresh: bool = True,
+                 tiers=None, headless=False, monitor=0):
+        super().__init__(headless, monitor, use_http=True)
+        self.folder_name = folder_name
+        self.refresh = refresh
+        self.tiers = tuple(tiers) if tiers else ()
+
+    def run(self):
+        try:
+            from ..lohas import attr_detail
+
+            client = get_client(self.headless, self.monitor, log=self._log)
+            s = client.session
+            f = self.folder_name
+
+            if self.refresh:
+                rows = db.lcode_rows(f)
+                self._log(f"[1/3] 작업상태 다시 읽기 — L코드 {len(rows):,}건")
+                self.stat.emit({"phase": "상태읽기", "processed": 0,
+                                "total": len(rows)})
+                res = attr_detail.collect_folder(
+                    client, rows, log=self._log,
+                    progress=lambda d, t: (
+                        self.progress.emit(d, t),
+                        self.stat.emit({"phase": "상태읽기", "processed": d,
+                                        "total": t})),
+                    should_stop=self.should_stop)
+                if res["rows"]:
+                    st = db.save_lcode_attr(f, res["rows"])
+                    self._log(f"      DB {st['rows']:,}행 {st.get('mirror','')}")
+            if self.should_stop():
+                self.finished.emit({"stopped": True}); return
+
+            self._log("[2/3] 카테고리 후보 조회 · 등급 매기기")
+            plan = category_plan.build(
+                s, db, f, tiers=self.tiers, log=self._log,
+                todo_only=True, should_stop=self.should_stop,
+                progress=lambda d, t: (
+                    self.progress.emit(d, t),
+                    self.stat.emit({"phase": "후보조회", "processed": d,
+                                    "total": t})))
+            plan = [p for p in plan if p.get("candidates")]
+            by_tier = {}
+            for p in plan:
+                by_tier[p.get("tier")] = by_tier.get(p.get("tier"), 0) + 1
+            self._log(f"      대상 {len(plan):,}종  " + " · ".join(
+                f"{k} {v}" for k, v in sorted(by_tier.items())))
+            if self.should_stop():
+                self.finished.emit({"stopped": True}); return
+
+            self._log(f"[3/3] 저장 — {len(plan):,}종")
+            ok = fail = 0
+            saved = []
+            for i, item in enumerate(plan, 1):
+                if self.should_stop():
+                    self._log("사용자 중단"); break
+                ch = category_plan.auto_choice(item, use_ai=False)
+                if not ch:
+                    continue
+                r = category_plan.save_group(
+                    s, item, ch["code"], capacity=ch.get("capacity", ""),
+                    unit=ch.get("unit", ""),
+                    total_capacity=ch.get("total_capacity", ""),
+                    log=self._log)
+                ok += r["ok"]; fail += r["fail"]; saved.extend(r["saved"])
+                self._log(f"  [{i}/{len(plan)}] {item['lcp_code']} "
+                          f"{ch['code']} {ch['name'][:22]} "
+                          f"({ch['tier']}/{ch['source']}) 저장 {r['ok']}건"
+                          + (f" 실패 {r['fail']}" if r["fail"] else ""))
+                self.progress.emit(i, len(plan))
+                self.stat.emit({"phase": "저장", "processed": i,
+                                "total": len(plan), "ok": ok, "fail": fail})
+
+            done = []
+            if saved:
+                self._log(f"저장분 {len(saved):,}건 재조회 중...")
+                for r in saved:
+                    try:
+                        d = attr_detail.fetch_detail(s, r["product_no"])
+                        d["lcp_code"] = r["lcp_code"]; d["l_code"] = r["l_code"]
+                        done.append(d)
+                    except Exception:
+                        pass
+                if done:
+                    st = db.save_lcode_attr(f, done)
+                    self._log(f"로컬 DB {st['rows']:,}행 {st.get('mirror','')}")
+                bad = [d for d in done if not d["cat_saved"]]
+                if bad:
+                    self._log(f"!! 반영 안 된 건 {len(bad)}건")
+            self.finished.emit({"ok": ok, "fail": fail, "lcps": len(plan),
+                                "verified": len(done), "by_tier": by_tier})
+        except Exception as e:
+            self._log(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+class TagAllWorker(BaseWorker):
+    """
+    **ALL 태그** — 폴더 하나의 태그를 끝까지 채운다.
+
+    대상은 **카테고리가 저장된 · 상품정보 미작업**이고, 대표이미지 상태는
+    가리지 않는다. 규칙은 `tag_batch` 에 있다.
+
+    태그 저장은 상품정보 상태를 바꾸지 않는다.
+    """
+
+    def __init__(self, folder_name: str, want: int = 10, any_image: bool = True,
+                 headless=False, monitor=0):
+        super().__init__(headless, monitor, use_http=True)
+        self.folder_name = folder_name
+        self.want = want
+        self.any_image = any_image
+
+    def run(self):
+        try:
+            from ..lohas import tag_batch
+
+            client = get_client(self.headless, self.monitor, log=self._log)
+            res = tag_batch.run(
+                client.session, db, self.folder_name, want=self.want,
+                any_image=self.any_image, apply_=True, log=self._log,
+                progress=lambda d, t: self.progress.emit(d, t),
+                should_stop=self.should_stop,
+                stat=lambda st: self.stat.emit(st))
+            if res.get("empty"):
+                self._log("후보가 아예 없던 LCP "
+                          f"{len(res['empty'])}종: "
+                          + ", ".join(res["empty"][:8]))
+            self.finished.emit(res)
+        except Exception as e:
+            self._log(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
 class DatalabWorker(BaseWorker):
     """네이버 데이터랩 카테고리별 인기키워드(최대 500) 수집. 로하스와 무관한 외부 API 다."""
 
@@ -1038,7 +1191,8 @@ class Fix10Worker(BaseWorker):
                 res = fix10.bulk(
                     lambda: fix10.clone_session(client.session), f,
                     both=self.both, limit=self.limit, log=self._log,
-                    stop=self.should_stop)
+                    stop=self.should_stop,
+                    progress=lambda d, t: self.progress.emit(d, t))
                 for k in tot:
                     tot[k] += (res.get(k) or 0)
             self.finished.emit(tot)
@@ -1116,3 +1270,99 @@ class StatusSyncWorker(BaseWorker):
                                 "counts": {k: len(v) for k, v in by_status.items()}})
         except Exception as e:
             self.failed.emit(f"{e}\n{traceback.format_exc()[:600]}")
+
+
+class AdSpendWorker(BaseWorker):
+    """
+    광고비 새로고침 — 켜 둔 계정·캠페인의 지출과 비즈머니 잔액.
+
+    로하스가 아니라 **네이버 검색광고 API** 를 부른다. 쿠키도 브라우저도
+    쓰지 않아 다른 작업과 겹쳐 돌아도 된다(2026-09-12).
+    """
+
+    def __init__(self, days: int = 1, base: bool = False):
+        super().__init__(False, 0, use_http=True)
+        self.days = days
+        self.base = base          # 계정·캠페인 기본정보도 다시 받을지
+
+    def run(self):
+        try:
+            from ..lohas import ad_account, ad_spend
+            if self.base:
+                self._log("계정·캠페인 기본정보를 받는 중…")
+                ad_account.collect(log=self._log)
+            else:
+                # 잔액만 갱신한다 - 캠페인 목록은 그대로 둔다
+                from ..lohas import searchad as sa
+                for a in ad_account.accounts(only_on=True):
+                    biz = sa.bizmoney(a["customer_id"])
+                    with db.sqlite_conn() as c:
+                        c.execute("UPDATE ad_account SET bizmoney=?,"
+                                  " updated_at=? WHERE customer_id=?",
+                                  (int(biz.get("bizmoney") or 0),
+                                   db.now_str(), a["customer_id"]))
+            res = ad_spend.collect_all(days=self.days, log=self._log)
+            # **오늘 매출은 커머스 API 로.** 주문 DB 는 당일이 비어 있다
+            # (2026-09-12 사용자).
+            try:
+                from ..lohas import commerce
+                if commerce.available():
+                    import datetime as _dt
+                    r = commerce.sales(_dt.date.today(), log=self._log)
+                    if r["orders"]:
+                        commerce.save(r, log=self._log)
+                    res["sales_today"] = r["amount"]
+            except Exception as e:
+                self._log(f"[커머스] {str(e)[:80]}")
+            self.finished.emit(res)
+        except Exception as e:
+            self._log(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+class OrderWatchWorker(BaseWorker):
+    """
+    새 주문 감시 — 커머스 API 로 오늘 주문을 훑어 **늘어난 것만** 알린다.
+
+    광고 상세는 어제까지지만 **주문은 실시간**이라 바로 잡힌다
+    (2026-09-12 사용자). 알림은 화면이 띄우고, 여기서는 숫자만 넘긴다.
+    """
+
+    def __init__(self, known: set = None):
+        super().__init__(False, 0, use_http=True)
+        self.known = set(known or ())
+
+    def run(self):
+        try:
+            import datetime as _dt
+            from ..lohas import ad_sales, commerce
+            if not commerce.available():
+                self.finished.emit({"skip": True})
+                return
+            day = _dt.date.today()
+            tok = commerce.token()
+            start = _dt.datetime.combine(day, _dt.time.min)
+            ids = commerce.changed_ids(start, _dt.datetime.now(), tok)
+            new_ids = [i for i in ids if i not in self.known]
+            fresh = []
+            if new_ids:
+                cmap = ad_sales._code_map()
+                for r in commerce.details(new_ids, tok):
+                    po = r.get("productOrder") or {}
+                    o = r.get("order") or {}
+                    if (po.get("productOrderStatus") or "") in commerce.DEAD:
+                        continue
+                    if ((o.get("orderDate") or "")[:10]) != str(day):
+                        continue          # 옛 주문의 상태 변경일 뿐이다
+                    code = str(po.get("productId") or "")
+                    fresh.append({
+                        "id": po.get("productOrderId"),
+                        "name": po.get("productName") or "",
+                        "qty": int(po.get("quantity") or 0),
+                        "amount": int(po.get("totalPaymentAmount") or 0),
+                        "lcp": (cmap.get(code) or ("", ""))[0],
+                        "ad": code in cmap,
+                    })
+            self.finished.emit({"ids": ids, "new": fresh, "day": str(day)})
+        except Exception as e:
+            self.failed.emit(str(e))

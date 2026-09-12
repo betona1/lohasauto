@@ -28,15 +28,18 @@ from app.lohas import (attr_detail, session as ses, tabs,  # noqa: E402
 
 
 def targets(lcp: str = "", folder: str = None, redo: bool = False,
-            any_image: bool = False) -> dict:
+            any_image: bool = False, any_status: bool = False) -> dict:
     """미작업 L코드를 LCP 단위로 묶는다."""
     folder = folder or db.get_job_folder()
     sql = ("SELECT a.lcp_code, a.l_code, a.product_no, a.tag_count, "
            "       a.etc_category, a.title1 "
            "FROM lcode_attr a "
            "JOIN lcp_lcode l ON l.product_no = a.product_no "
-           "WHERE a.folder_name = ? AND a.cat_saved = 1 "
-           "  AND l.info_status = '미작업'")
+           "WHERE a.folder_name = ? AND a.cat_saved = 1")
+    if not any_status:
+        # 기본은 미작업만. **저장하면 사이트가 저장완료로 넘긴다** -
+        # 이미 넘어간 것을 고칠 때만 --done 으로 연다 (2026-09-08).
+        sql += " AND l.info_status = '미작업'"
     if not any_image:
         # 기본은 화면의 「미작업목록」과 같은 범위 — 대표이미지 승인완료
         sql += " AND l.img_status = '이미지승인완료'"
@@ -74,6 +77,13 @@ def main():
                     help="상품명이 이미 있어도 다시 만든다 (규칙이 바뀌었을 때)")
     ap.add_argument("--min-len", type=int, default=0,
                     help="--redo 와 함께 - 지금 상품명이 이 글자수 이상이면 둔다")
+    ap.add_argument("--done", action="store_true",
+                    help="이미 '저장완료' 로 넘어간 것도 대상에 넣는다. "
+                         "상태는 더 바뀌지 않으므로 값만 고칠 때 쓴다")
+    ap.add_argument("--force", action="store_true",
+                    help="사람이 고친 상품명도 덮어쓴다. 지금 값은 "
+                         "title_backup 에 남긴다 (형제끼리 상품명이 같아 "
+                         "다시 만들 때만 쓴다)")
     ap.add_argument("--no-tag", action="store_true",
                     help="태그가 비어 있어도 채우지 않는다")
     ap.add_argument("--folder", default="",
@@ -82,12 +92,13 @@ def main():
     args = ap.parse_args()
 
     folder = args.folder or db.get_job_folder()
+    RUN_ID = "redo-" + db.now_str().replace(" ", "_")
     skip_words = [w.strip() for w in
                   db.get_setting("title_skip_words", "").split(",") if w.strip()]
     if skip_words:
         print(f"제외 품목: {', '.join(skip_words)}", flush=True)
     groups = targets(args.lcp, folder, redo=args.redo,
-                     any_image=args.any_image)
+                     any_image=args.any_image, any_status=args.done)
     names = list(groups)
     if args.lcp_file:
         only = {x.strip() for x in open(args.lcp_file, encoding="utf-8") if x.strip()}
@@ -147,7 +158,8 @@ def main():
         # 그 LCP 상품명들에 공통으로 든 낱말 — 그 물건이 무엇인지다.
         # 상품명에서 빠지면 말이 안 되므로 먼저 넣는다(사용자 2026-09-06).
         names_all = tag_auto.child_names(cli.session, groups[lcp])
-        must = title_auto.common_words(names_all)
+        must = title_auto.head_words(names_all, str(
+            groups[lcp][0].get("etc_category") or ""))
         if must:
             print(f"    [공통] {', '.join(must[:6])}", flush=True)
         # 절반 넘는 형제가 함께 쓰는 낱말은 구별점이 아니다. 그것을 뺀
@@ -168,16 +180,22 @@ def main():
                 # 우리가 저장하면 그 값을 DB(lcode_attr.title1)에도 적어둔다.
                 # 지금 사이트 값이 그것과 다르면 사람이 손본 것이다
                 # (2026-09-06 사용자 지시 - L1780433 을 덮을 뻔했다).
-                if cur and mine and cur != mine:
+                if cur and mine and cur != mine and not args.force:
                     skip += 1
                     print(f"    [보호] {L} 사람이 고친 상품명 - 건너뜀: "
                           f"{cur[:30]}", flush=True)
                     continue
-                if cur and not mine:
+                if cur and not mine and not args.force:
                     skip += 1
                     print(f"    [보호] {L} 우리 기록에 없는 상품명 - 건너뜀",
                           flush=True)
                     continue
+                if args.force and cur:
+                    # 덮기 전에 지금 값을 남긴다. 되돌릴 근거다.
+                    db.save_title_backup(
+                        RUN_ID, [{**r, "lcp_code": lcp, "title1": cur,
+                                  "product_name": pn0,
+                                  "reason": "--force 로 다시 만듦"}])
                 if not args.redo and cur:
                     skip += 1          # 사람이 넣었거나 이미 만든 것
                     continue
@@ -198,6 +216,18 @@ def main():
                     avoid=title_auto.sibling_words(lcp, L), must=must,
                     own_uniq=set(tag_auto.words_of(pn)) - shared,
                     log=lambda *_: None)
+                if not res["ok"] or not res["title"]:
+                    # **형제 중복 회피를 풀고 한 번 더.** 형제가 많은 LCP 는
+                    # 앞쪽이 좋은 후보를 다 가져가 뒤쪽이 빈칸으로 남는다.
+                    # 겹치더라도 상품명이 있는 편이 낫다 - 엑사에서 268건이
+                    # 그렇게 비어 있었다(2026-09-09).
+                    res = title_auto.build_and_check(
+                        cli.session, page, pn, brand=brand, maker=maker,
+                        use_ai=not args.no_ai,
+                        cid=str(r.get("etc_category") or ""),
+                        avoid=None, must=must,
+                        own_uniq=set(tag_auto.words_of(pn)) - shared,
+                        log=lambda *_: None)
                 if not res["ok"] or not res["title"]:
                     fail += 1
                     continue

@@ -69,10 +69,15 @@ def fetch_attributes(session, leaf: str, timeout=30) -> list:
 _CAP_G = {"KG": 1000, "K": 1000, "G": 1, "GR": 1, "㎏": 1000, "T": None}
 _CAP_ML = {"L": 1000, "ML": 1, "리터": 1000, "CC": 1}
 _CAP_EA = {"개": 1, "매": 1, "장": 1, "정": 1, "포": 1, "T": 1, "티백": 1}
+# 길이로 파는 것 — 종이호일·랩·테이프. 총 용량은 m 로 적는다.
+_CAP_M = {"M": 1, "미터": 1, "CM": 0.01}
 # 수량 단위. PET·펫(음료 병)과 묶음(박스·줄·판)도 수량이다 —
 # '1.25L 12PET' 을 못 읽어 12를 놓쳤다(2026-09-07 코카콜라).
+# 'T'(티백·스틱)도 수량이다 — '4gx10T' 는 4g 짜리 10개니 40g 이다.
+# 없을 때는 10을 안 곱해 4g 로 들어갔다(2026-09-10 L4271877, 사용자 확인).
+# 긴 것을 먼저 적는다.
 _QTY = (r"(?:개입|개|입|팩|봉|포|매|장|병|캔|박스|BOX|줄|판|세트|SET"
-        r"|PET|펫|EA|P)")
+        r"|PET|펫|EA|티백|T|P)")
 
 
 def parse_capacity(name: str, unit: str = "g"):
@@ -90,8 +95,27 @@ def parse_capacity(name: str, unit: str = "g"):
       · 용량 표기가 둘 이상인 것
     """
     u = (unit or "g").strip().lower()
-    tab = _CAP_G if u in ("g", "kg", "㎏") else (
-        _CAP_ML if u in ("ml", "l", "cc") else _CAP_EA)
+    if u in ("g", "kg", "㎏"):
+        tab = _CAP_G
+    elif u in ("ml", "l", "cc"):
+        tab = _CAP_ML
+    elif u in ("m", "미터", "M".lower()):
+        # 길이로 파는 것(종이호일·랩·테이프). 상품명에 폭(cm)이 같이 적혀
+        # 있는데 그건 길이가 아니다 — '25cm x 10M' 은 10m 다(2026-09-10).
+        tab = _CAP_M
+        # '30CMx20M' 처럼 곱하기가 바로 붙는 표기도 지워야 한다.
+        # (?![a-z]) 로만 막으면 뒤의 x 때문에 30CM 이 안 잡힌다.
+        name = re.sub(r"[0-9]+(?:\.[0-9]+)?\s*cm(?=$|[^a-z0-9]|[xX*×])", " ",
+                      str(name or ""), flags=re.I)
+    else:
+        tab = _CAP_EA
+    # 매·장으로 세는 품목(물티슈·기저귀)의 상품명에는 무게가 같이 적혀
+    # 있곤 한다 — '80매 225g 10개'. 그 무게는 셀 것이 아니라 지운다
+    # (2026-09-10 사용자: "물티슈 기저귀는 매수로 표기").
+    if tab is _CAP_EA:
+        name = re.sub(
+            r"[0-9]+(?:\.[0-9]+)?\s*(?:kg|g|ml|l|cc)(?=$|[^a-z0-9]|[xX*×])",
+            " ", str(name or ""), flags=re.I)
     keys = sorted([k for k, v in tab.items() if v], key=len, reverse=True)
     if not keys:
         return None, ""
@@ -113,7 +137,15 @@ def parse_capacity(name: str, unit: str = "g"):
         if v > 0:
             return int(round(v)), "총 " + tot.group(0).replace("총", "").strip()
     if len(m) > 1:
-        return None, "용량 표기가 여러 개"
+        # **수량 단위(매·장·개)는 앞의 것이 1회분, 뒤는 곱하는 수다.**
+        #   '64매 6개입x2팩'  -> 64 x 6 x 2 = 768
+        #   '100매 10개'      -> 100 x 10   = 1,000
+        # 무게·부피(g·ml)는 표기가 둘이면 어느 쪽이 총량인지 알 수 없어
+        # 그대로 포기한다 — 틀리면 반품 사유다
+        # (2026-09-10 사용자: "64 6개 2팩 이라 64x6x2", "물티슈 기저귀는 매수").
+        if tab is not _CAP_EA:
+            return None, "용량 표기가 여러 개"
+        m = m[:1]
     val = float(m[0].group(1)) * tab[m[0].group(2)]
     rest = t[m[0].end():]
     # 수량은 **여러 겹**일 수 있다. '300ml x 24펫 x 2박스' 는 24 x 2 다.

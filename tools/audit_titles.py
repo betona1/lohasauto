@@ -48,13 +48,16 @@ def problems(title: str, own: str, cid: str, rules: dict,
     상품명이 주장하고 있으면 근거가 없는 것이다.
     """
     base = (own or "") + " " + (db.category_name(cid) or "")
-    # 규격은 대문자로 뽑히는데 원상품명은 '425g' 처럼 소문자다.
-    # 그대로 비교하면 멀쩡한 것이 걸린다(2026-09-07).
-    ubase = base.upper()
     out = []
     # 1) 규격·종류·색상·기능 — 원상품명에 없으면 못 쓴다
+    #
+    # **양쪽 다 `specs_of` 로 뽑아 견준다.** 글자로만 대면 표기가 다른 같은
+    # 말이 걸린다 - 원상품명 '스테인레스' 를 두고 상품명 '스텐' 을 근거없음
+    # 으로, '미니금고' 를 두고 '소형' 을 근거없음으로 잡았다(2026-09-09).
+    # 저장·태그 쪽 판정(`spec_ok`)과 같은 기준이어야 한다.
+    own_specs = tag_auto.specs_of(base)
     for sp in sorted(tag_auto.specs_of(title)):
-        if sp.upper() not in ubase:
+        if sp not in own_specs:
             out.append(f"규격 '{sp}'")
     # 2) 숫자·행사표기
     import re as _re
@@ -201,9 +204,17 @@ def main():
         groups.setdefault(r["lcp_code"], []).append(r)
     print(f"\n다시 만들기 — {len(groups)}종 LCP", flush=True)
     for lcp in groups:
+        # --no-ai : AI 선별을 쓰면 근거 없는 말이 다시 들어온다(부품함에
+        #           '셋톱박스·팬트리'). 규칙만으로 만든다(2026-09-09).
+        # --force : 여기 걸린 것은 이미 어긋난 상품명이다. 백업은 위에서 했다.
+        # --no-tag: 태그는 따로 돌린다.
         os.system(
             f'python -X utf8 -u tools/fill_titles.py --lcp {lcp} '
-            f'--folder "{groups[lcp][0]["folder_name"]}" --redo --apply')
+            f'--folder "{groups[lcp][0]["folder_name"]}" '
+            # --any-image : 점검은 이미지 상태를 안 가리는데 재작성만 가리면
+            #               '어긋났다고 잡아놓고 못 고치는' 건이 남는다
+            #               (2026-09-09 B913965·B915321).
+            f'--redo --force --no-tag --no-ai --any-image --apply')
 
 
 if __name__ == "__main__":

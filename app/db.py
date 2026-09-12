@@ -1781,6 +1781,41 @@ def today_totals(folder_name: str = None, date_str: str = None) -> dict:
 
     # 실제 관측한 시간(분) - 중단구간 제외
     span = rate_stats(folder_name, minutes=24 * 60)["span_min"]
+
+    # **점검 기록으로도 재본다.** work_log 는 자동점검이 그 폴더를 볼 때만
+    # 쌓인다. 하루 중간에 자동점검을 그 폴더로 옮기면 그 전에 한 일이 통째로
+    # 안 보인다 — 엑사에서 오늘 2건(10->12)을 했는데 0 으로 나왔다
+    # (2026-09-10 사용자). 어제 마지막 점검과 오늘 마지막 점검의 차이가
+    # 그 폴더의 오늘 작업량이다.
+    def _by_scan(col):
+        sql = ("SELECT scanned_at, %s AS v FROM scan "
+               "WHERE mode <> 'quick'" % col)
+        a = []
+        if folder_name:
+            sql += " AND folder_name = ?"
+            a.append(folder_name)
+        sql += " ORDER BY scanned_at"
+        with sqlite_conn() as conn:
+            rows = [dict(r) for r in conn.execute(sql, a)]
+        today = [r["v"] for r in rows if str(r["scanned_at"])[:10] == day
+                 and r["v"] is not None]
+        prev = [r for r in rows if str(r["scanned_at"])[:10] < day
+                and r["v"] is not None]
+        if not today or not prev:
+            return 0
+        # **어제 잰 것이어야 오늘 것으로 셀 수 있다.** 점검이 며칠 비었으면
+        # 그 사이 늘어난 것을 오늘로 몰아 세게 된다 — 엑사에서 09-08 이후
+        # 처음 재는 바람에 이미지승인 946건이 오늘로 잡혔다(2026-09-10).
+        from datetime import datetime, timedelta
+        last_day = str(prev[-1]["scanned_at"])[:10]
+        y = (datetime.strptime(day, "%Y-%m-%d")
+             - timedelta(days=1)).strftime("%Y-%m-%d")
+        if last_day != y:
+            return 0
+        return max(0, today[-1] - prev[-1]["v"])
+
+    info = max(info, _by_scan("info_save_rows"))
+    img = max(img, _by_scan("img_done_rows"))
     return {"date": day, "info": info, "img": img, "analyzed": analyzed,
             "samples": samples, "active_hours": active_hours,
             "span_min": span,
@@ -2943,6 +2978,31 @@ def category_name(code: str) -> str:
         except Exception:
             _CAT_NAME = {}
     return _CAT_NAME.get(str(code or ""), "")
+
+
+def save_lcode_image(l_code: str, product_no, d: dict) -> None:
+    """
+    대표이미지 URL 을 남긴다 (원본 / 현재(AI)).
+
+    화면이 다시 열릴 때 빠르게 뜨라고 두는 것이고, **판단의 근거는 늘
+    그때 받아온 값**이다 — AI 이미지는 나중에 생기기도 한다(2026-09-10).
+    """
+    with sqlite_conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS lcode_image (
+            l_code TEXT PRIMARY KEY, product_no TEXT, uid TEXT,
+            ai INTEGER, org_main TEXT, edit_main TEXT,
+            org_n INTEGER, edit_n INTEGER, updated_at TEXT)""")
+        c.execute(
+            "INSERT OR REPLACE INTO lcode_image (l_code, product_no, uid, ai,"
+            " org_main, edit_main, org_n, edit_n, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (l_code, str(product_no), str(d.get("uid") or ""),
+             1 if d.get("ai") else 0,
+             (d.get("org") or {}).get("main1", ""),
+             (d.get("edit") or {}).get("main1", ""),
+             len((d.get("org") or {}).get("detail") or []),
+             len((d.get("edit") or {}).get("detail") or []),
+             now_str()))
 
 
 def save_cat_rule(cid: str, scope: str, word: str, action: str,

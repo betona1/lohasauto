@@ -440,7 +440,7 @@ def clone_session(base):
 
 
 def bulk(session_factory, folder: str, *, both: bool = True, limit: int = 0,
-         dry: bool = False, log=print, stop=None) -> dict:
+         dry: bool = False, log=print, stop=None, progress=None) -> dict:
     """
     폴더 하나를 통째로 처리한다. 기본은 **정방향·역방향 동시**다.
 
@@ -495,6 +495,13 @@ def bulk(session_factory, folder: str, *, both: bool = True, limit: int = 0,
                 cnt[res["result"] if res["result"] in cnt else "ok"] += 1
                 i = cnt["n"]
             db.save_fix10_log(run_id, folder, row, order, res, el)
+            if progress:
+                # 화면 진행바용. 없으면 바가 불확정 상태로 계속 흐른다
+                # (2026-09-08 사용자: "밑에 바가 이상하게 뜬다")
+                try:
+                    progress(i, total)
+                except Exception:
+                    pass
             mark = {"ok": "완료", "soldout": "품절-건너뜀",
                     "dry": "미리보기", "fail": "실패"}.get(res["result"], "?")
             log(f"  [{i}/{total}] {'▶' if order == 'asc' else '◀'} "

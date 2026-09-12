@@ -83,6 +83,9 @@ def main():
                          " 먼저 남긴다 (0=전부)")
     ap.add_argument("--folder", default="")
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="사람이 고친 상품명도 덮어쓴다 (사용자가 명시적으로"
+                         " 다시 만들라고 할 때만)")
     args = ap.parse_args()
 
     extra = [w.strip() for w in args.words.split(",") if w.strip()]
@@ -115,9 +118,12 @@ def main():
             cli.session, r["product_no"])["title1"] or "").strip()
         mine = (r["title1"] or "").strip()
         if live and mine and live != mine:
-            print(f"  [보호] {L} 사람이 고친 상품명 | {live[:34]}", flush=True)
-            skip += 1
-            continue
+            if not args.force:
+                print(f"  [보호] {L} 사람이 고친 상품명 | {live[:34]}",
+                      flush=True)
+                skip += 1
+                continue
+            print(f"  [덮어씀] {L} 이전: {live[:34]}", flush=True)
 
         base = [w for w in name_words(pn) if w not in drop]
         if args.brand:

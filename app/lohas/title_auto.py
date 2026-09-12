@@ -39,13 +39,48 @@ from . import keywords, tabs, tag_auto
 _TOKEN_RE = re.compile(r"[A-Za-z]+[0-9]*|[0-9]+[A-Za-z]*|[가-힣]+")
 # 원상품명에서 그대로 가져다 쓸 수 있는 용량·수량 표기
 _QTY_IN_TEXT = re.compile(
-    r"[0-9]+(?:\.[0-9]+)?(?:KG|G|ML|L|K|CM|MM|W|개입|개|입|팩|봉|매|장|정"
+    # 길이 'M'(미터)가 빠져 있어 '2.5m' 이 통째로 안 잡혔고, 그 바람에
+    # 낱말 규칙이 '5m' 조각을 주워 상품명에 넣었다(2026-09-09 엑사).
+    # 긴 단위를 먼저 적는다 - 'MM' 이 'M' 보다 앞이어야 한다.
+    r"[0-9]+(?:\.[0-9]+)?(?:KG|G|ML|MM|CM|M|L|K|W|개입|개|입|팩|봉|매|장|정"
     r"|스틱|EA|P)(?![0-9A-Za-z가-힣])", re.I)
+# 모델명·치수 - 형제를 가르는 말이라 **한 덩어리로** 가져와야 한다.
+#   CA510-2  를 쪼개면 형제 CA510 과 같아지고,
+#   300x230x132 를 쪼개면 'x230' 같은 조각만 남는다 (2026-09-08).
+_MODEL_RE = re.compile(
+    r"[0-9]+(?:[xX*][0-9]+){1,2}(?:CM|MM|cm|mm)?"
+    r"|[A-Za-z]{1,6}-?[0-9]{2,}(?:-[0-9]{1,3})?"
+    # 한글 뒤에 붙은 모델번호. '욕실용논슬립14' 와 '논슬립12' 는 다른
+    # 상품인데 낱말 규칙이 '14'·'12' 를 떼어내 버려 형제가 같아졌다
+    # (2026-09-09 엑사 LCP_LHA_B560501).
+    r"|[가-힣]{2,}[0-9]{1,3}(?![0-9])"
+    # '4단'·'3구' 는 낱말 규칙(한글 2자 이상)에 안 걸려 통째로 사라졌다.
+    # 3단과 4단은 다른 상품이다 (2026-09-08).
+    r"|[0-9]+(?:단|구|칸|층|인용|종|PCS|pcs)")
+
+# 한글로만 된 낱말 (내부 코드 'h50'·'CBT651576' 을 가른다)
+_HANGUL_RE = re.compile(r"[가-힣]+")
+
 _QTY_TOKEN = re.compile(
     r"^[0-9]+(?:\.[0-9]+)?(?:KG|G|ML|L|K|CM|MM|W|개입|개|입|팩|봉|매|장|정"
     r"|스틱|EA|P)$", re.I)
 
 CLICK_ONLY = True      # 상품명은 **후보 클릭으로만** 만든다 (사용자 2026-09-06).
+
+
+def _borrow_ok(w: str) -> bool:
+    """원상품명에서 직접 쳐 넣어도 되는 낱말인가.
+
+    용량·수량에 더해 **규격**도 넣는다 - A4·A3·SA2·30X36 처럼 봉투의 크기가
+    상품명에서 빠지면 무엇을 사는지 알 수 없다
+    (2026-09-08 사용자: "기존상품명의 규격을 주로 넣어서").
+    지어낸 말이 아니라 그 상품 이름에 적힌 사실이라 틀릴 위험이 없다.
+    """
+    if _QTY_TOKEN.match(w or ""):
+        return True
+    if _MODEL_RE.fullmatch(w or ""):     # 모델명·치수는 형제를 가르는 사실
+        return True
+    return bool(tag_auto.specs_of(w or ""))
                        # 입력칸 직접 입력이 되긴 하지만, 후보에 없는 말이 붙어
                        # 상품과 안 맞는 상품명이 나왔다. 짧아지더라도 클릭만 쓴다.
 MAX_LEN = 50          # 사이트 상한
@@ -139,6 +174,11 @@ def fuzzy_count(text: str, word: str) -> int:
 def common_words(names: list, ratio: float = 1.0) -> list:
     """그 LCP 상품명들에 공통으로 든 낱말. 판정은 `tag_auto` 에 있다."""
     return tag_auto.common_words(names, ratio)
+
+
+def head_words(names: list, cid: str = "") -> list:
+    """그 LCP 의 품목 이름. 판정은 `tag_auto` 에 있다 (상품명·태그 공용)."""
+    return tag_auto.head_words(names, cid)
 
 
 def sibling_words(lcp_code: str, skip_l: str = "") -> dict:
@@ -326,6 +366,19 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
                 if not any(w in d["relKeyword"] and w not in own_name
                            for w in rules["ban"])]
 
+    # 사용자가 '무조건 넣어' 라고 한 말(cat_rule must)은 금지어 필터보다 앞선다.
+    # 로하스는 'C타입USB허브' 를 ban_word='usb'(전파인증)로 표시해 후보에서
+    # 통째로 빠졌다. 사람이 넣으라고 한 것은 사람 판단이 우선이다
+    # (2026-09-08 사용자 지시 LCP_LHA_B915923).
+    if rules["must"]:
+        seen = {id(d) for d in pool}
+        forced = [d for d in page["candidates"]
+                  if id(d) not in seen
+                  and any(w in (d.get("relKeyword") or "")
+                          for w in rules["must"])]
+        if forced:
+            pool = forced + pool
+
     # 브랜드는 **그 L코드 원상품명에 있을 때만** 넣는다. 같은 LCP 라도 L코드마다
     # 제조사가 다르다 - 해림바스 LCP 안의 '이누스' 상품에 '해림' 이 붙었다
     # (2026-09-05). 우리 브랜드든 남의 브랜드든 판단 기준은 원상품명이다.
@@ -489,18 +542,37 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
 
     def cap_text(d):
         """실제로 들어갈 글자. 후보 이름은 오타여도 들어가는 말은 고쳐진다 —
-        '이동식헹거' 를 누르면 '이동형행거' 가 들어간다(2026-09-05)."""
-        return (d.get("relKeyword") or "") + " " + " ".join(d.get("terms") or [])
+        '이동식헹거' 를 누르면 '이동형행거' 가 들어간다(2026-09-05).
+
+        **후보 이름과 형태소를 같이 세면 안 된다.** '귀여운인형' 의
+        terms 는 ['귀여운','인형'] 인데 둘을 이으면 '인형' 이 두 번으로
+        세어져, 인형처럼 모든 후보가 같은 꼬리를 가진 LCP 에서 cap 이
+        곧바로 터진다 — 상품명이 6자에서 끝났다(2026-09-09 LCP_LHA_B915483).
+        """
+        terms = [t for t in (d.get("terms") or []) if t]
+        return " ".join(terms) if terms else (d.get("relKeyword") or "")
+
+    def cap_new(d):
+        """이 후보를 눌러 **새로 붙는 말**만 센다.
+
+        이미 들어 있는 형태소는 사이트가 다시 넣지 않는다(`preview_click`).
+        그런데 후보 전체를 세면 '귀여운인형' 이 '인형' 을 또 하나 쓴 것으로
+        잡혀, 인형처럼 모든 후보가 같은 꼬리를 가진 LCP 에서 cap 이 두세
+        번만에 터진다 — 상품명이 8자에서 끝났다(2026-09-09 LCP_LHA_B915483).
+        """
+        terms = [t for t in (d.get("terms") or []) if t]
+        pv = preview_click(order, terms, syn)
+        return " ".join(pv["added"]) or (cap_text(d) if not terms else "")
 
     def cap_ok(d):
-        txt = cap_text(d)
+        txt = cap_new(d)
         for t, lim in caps.items():
             if seen_cap[t] + fuzzy_count(txt, t) > lim:
                 return False
         return True
 
     def cap_add(d):
-        txt = cap_text(d)
+        txt = cap_new(d)
         for t in caps:
             seen_cap[t] += fuzzy_count(txt, t)
 
@@ -516,6 +588,44 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
 
     picked, order, steps = [], [], []
     adds = []                              # picked 와 짝 - 그 클릭이 붙인 형태소
+
+    # 사용자가 넣으라고 한 말(cat_rule must)은 **맨 먼저** 자리를 잡는다.
+    # 후보에 없어도 직접 친다 - 상품명 칸은 직접 입력이 된다
+    # (handleManualInput). 뒤에서 넣으면 25~29자에 자리가 없어 늘 떨어지고,
+    # 사이트가 '유의어 반복' 으로 되돌리면 cap 예산을 클릭이 먼저 써버려
+    # 또 떨어진다 - '가게봉투·상점봉투' 가 그랬다(2026-09-08 사용자 지시).
+    # 여기서 먼저 세면 같은 말이 든 클릭 쪽이 대신 막힌다.
+    # rules["must"] : 사용자가 카테고리에 지정한 말
+    # must          : 그 LCP 상품명 전부에 든 낱말(= 품목·브랜드). 원상품명에
+    #                 있는 사실이라 후보에 없어도 쳐 넣는다. 이게 빠져서
+    #                 '반바오 블록' 이 상품명에서 사라졌다(2026-09-09).
+    # LCP 공통 낱말은 **그 상품 원상품명에 실제로 있을 때만** 쳐 넣는다.
+    # `must` 는 공통 낱말이 없으면 카테고리 이름으로 대신하는데, 그건
+    # 판정용이지 넣을 말이 아니다 - 인형 16건이 전부 '봉제인형 인형' 으로
+    # 시작해 버렸다(2026-09-09).
+    # `must` 에는 판정용으로 잘라 만든 꼬리가 섞여 있다 - '봉제인형' 에서
+    # 뽑은 '인형', '반바오' 의 '바오', '앞치마' 의 '치마'. 판정에는 필요하지만
+    # **상품명에 그대로 넣으면 '반바오 바오 블록' 이 된다**(2026-09-09).
+    tails = {w for w in (must or [])
+             for o in (must or []) if w != o and o.endswith(w)}
+    # **여기서 미리 쳐 넣는 것은 사용자가 카테고리에 지정한 말뿐이다.**
+    # LCP 공통 낱말까지 늘 넣었더니 후보 클릭이 밀려났다. 공통 낱말은
+    # 후보로 25자를 못 채울 때만 아래 빌리기 단계에서 들어간다(2026-09-10).
+    seed = list(rules["must"])
+    if caps:
+        # 사이트가 '유의어 반복' 으로 되돌린 뒤(cap>0)에는 **그 말이 든 공통
+        # 낱말을 앞에서 빼둔다.** 안 그러면 '동물인형' 이 '인형' 예산을 먼저
+        # 써버려 뒤의 클릭이 다 막히고 상품명이 8자에서 끝난다
+        # (2026-09-09 LCP_LHA_B915483). 사용자가 지정한 말은 그대로 둔다.
+        seed = [w for w in seed
+                if w in rules["must"]
+                or not any(fuzzy_count(w, t) for t in caps)]
+    for w in (seed if CLICK_ONLY else list(must or [])):
+        if not w or not cap_word(w):
+            continue
+        order.append(w)
+        steps.append({"kw": w, "added": [w], "len": len(" ".join(order)),
+                      "must": True})
     for d in ordered:
         if not cap_ok(d):
             continue
@@ -549,10 +659,15 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
                           "len": len(" ".join(order)), "skip": "50자 초과"})
             continue
         before = len(" ".join(order))
+        # **cap 은 붙이기 전에 세야 한다.** `cap_add` 는 `preview_click` 으로
+        # '이번에 새로 붙는 말' 을 다시 구하는데, order 에 이미 넣은 뒤에
+        # 부르면 붙을 것이 없어 늘 0 이 된다 - 예산이 한 번도 줄지 않아
+        # '유의어 반복' 지적이 네 번을 다 써도 풀리지 않았다
+        # (2026-09-10 LCP_LHA_B561478 미용가위 - 상품명이 빈칸으로 남았다).
+        cap_add(d)
         order += pv["added"]
         picked.append(d)
         adds.append(pv["added"])
-        cap_add(d)
         steps.append({"kw": d["relKeyword"], "added": pv["added"],
                       "len": pv["len"], "warn": before < WARN_LEN <= pv["len"]})
         if pv["len"] >= WARN_LEN:
@@ -641,22 +756,51 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
     # 먼저 보는 값이다 - 500g 인지 5kg 인지가 상품명에 없으면 안 된다
     # (2026-09-07 사용자: "제품의 용량은 될수있으면 넣어주자").
     # 자리가 없으면 뒤쪽 클릭을 하나 빼고 그 자리에 넣는다.
-    for w in borrow_from_name(own_name, order):
-        if not _QTY_TOKEN.match(w):
+    # **그 상품만의 낱말**(원상품명에만 있는 말)도 빌려 쓴다. 인형이 무엇인지
+    # — 쿠로미인지 슈퍼맨인지 흰둥이인지 — 는 후보 표에 없을 때가 많은데,
+    # 그게 빠지면 형제끼리 똑같은 상품명이 된다
+    # (2026-09-09 사용자: "인형의 원본상품명 추가해서 상품명 다시 만들어줘").
+    # 한글 두 글자 이상만 쓴다 - 'h50' 같은 내부 코드는 상품명에 안 넣는다.
+    uniq_typed = {w for w in (own_uniq or set())
+                  if len(w) >= 2 and _HANGUL_RE.fullmatch(w)}
+
+    # **후보로 채우는 것이 먼저다.** 원상품명에서 직접 치는 것은
+    #   · 용량·수량 : 늘 넣는다 (2026-09-07 "제품의 용량은 될수있으면")
+    #   · 그 밖(규격·모델명·그 상품만의 낱말·LCP 공통 낱말) :
+    #     **후보로 25자를 못 채웠을 때만**
+    #     (2026-09-10 사용자: "없을때만 원본상품명에서 넣어서 하는거야")
+    # 늘 넣었더니 엑사 상품명 낱말의 3분의 1이 직접 입력이 됐다.
+    short = len(tighten(joined())) < TARGET_MIN
+    extra = [w for w in (must or [])
+             if w not in tails and w in (own_name or "")
+             and _HANGUL_RE.fullmatch(w) and w not in order]
+    borrowed = []
+    for w in (borrow_from_name(own_name, order) + extra):
+        if not _QTY_TOKEN.match(w or "") and not short:
+            continue                        # 후보로 충분하면 손대지 않는다
+        if len(borrowed) >= 2 and w not in uniq_typed:
+            break                           # 규격을 셋씩 늘어놓지 않는다
+        if (not _borrow_ok(w) and w not in uniq_typed and w not in extra)                 or w in order:
             continue
-        if w in order:
-            continue
+        # 자리를 비울 때 **앞서 빌려온 규격은 빼지 않는다**. 그냥 pop 하면
+        # 방금 넣은 모델명이 다음 치수에 밀려 사라진다 - 형제를 가르는 말이
+        # 그렇게 없어졌다(2026-09-08 LCP_LHA_B915822 CA514 -> 268x353).
         while len(joined() + " " + w) > TARGET_MAX and len(order) > 2:
-            order.pop()                     # 뒤에서부터 자리를 비운다
+            cut = next((i for i in range(len(order) - 1, -1, -1)
+                        if order[i] not in borrowed), None)
+            if cut is None:
+                break
+            order.pop(cut)
         if len(joined() + " " + w) > TARGET_MAX or not cap_word(w):
             continue
         order.append(w)
+        borrowed.append(w)
         steps.append({"kw": w, "added": [w], "len": len(joined()),
                       "qty": True})
 
     if len(tighten(joined())) < TARGET_MIN:
         for w in borrow_from_name(own_name, order):
-            if CLICK_ONLY and not _QTY_TOKEN.match(w):
+            if CLICK_ONLY and not _borrow_ok(w):
                 continue
             if len(joined() + " " + w) > TARGET_MAX:
                 continue
@@ -703,7 +847,12 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
 
     # 그래도 공통 낱말이 빠졌으면 직접 넣는다. 상품명 칸은 직접 입력이
     # 되므로(handleManualInput) 후보에 없어도 넣을 수 있다.
-    for w in ([] if CLICK_ONLY else (must or [])):
+    # 후보에 아예 없는 말이라도 **사용자가 넣으라고 한 것**(cat_rule must)은
+    # 직접 쳐 넣는다. 상품명 칸은 직접 입력이 되고(handleManualInput),
+    # 사람이 지정한 말을 사이트 후보 유무로 막을 이유가 없다
+    # (2026-09-08 사용자 지시 - 봉투에 '가게봉투·상점봉투').
+    typed = list(rules["must"]) if CLICK_ONLY else list(must or [])
+    for w in typed:
         cur = " ".join(order)
         # 띄어쓰기를 빼고 견준다 - '냄새 차단' 이 있는데 '냄새차단' 을 또
         # 넣어 같은 말이 두 번 들어갔다(2026-09-06)
@@ -725,6 +874,11 @@ def build_title(page: dict, own_name: str, *, want_max: int = TARGET_MAX,
             "steps": steps, "datalab": extra_used}
 
 
+# 묶음 표기 ' X5' · ' ×10' — 낱개와 5개들이를 가르는 유일한 말일 때가 있다
+# ('해물완자 (씨밀레 냉장 1K) X5' vs 같은 이름 낱개). 2026-09-09 엑사.
+_PACK_RE = re.compile(r"[)\s]\s*[xX×]\s*([0-9]{1,3})\s*$")
+
+
 def borrow_from_name(own_name: str, order: list) -> list:
     """
     원상품명에서 빌려 쓸 낱말. **용량·수량을 먼저** 준다.
@@ -737,8 +891,30 @@ def borrow_from_name(own_name: str, order: list) -> list:
     # 낱말로 쪼개면 '12' 와 '개' 로 갈라져 쓸 수 없다(2026-09-06).
     qty = [w for w in _QTY_IN_TEXT.findall(own_name or "")
            if w.upper() not in have]
-    words = [w for w in _TOKEN_RE.findall(own_name or "")
-             if len(w) >= 2 and w.upper() not in have]
+    m_pack = _PACK_RE.search(own_name or "")
+    if m_pack:
+        w = f"{int(m_pack.group(1))}개"
+        if w.upper() not in have and w not in qty:
+            qty.insert(0, w)
+    # 모델명은 통째로 가져온다. 낱말로 쪼개면 'CA510-2' 가 'CA510' 이 되어
+    # 형제 'CA510' 과 똑같은 상품명이 된다(2026-09-08 LCP_LHA_B915822).
+    model = [w for w in _MODEL_RE.findall(own_name or "")
+             if w.upper() not in have]
+    # **소수점 뒤 조각을 주워오면 안 된다.** 낱말 규칙에 '.' 이 없어서
+    # '2.5m' 이 '2' 와 '5m' 로 갈리고, 그 '5m' 이 상품명에 들어갔다 —
+    # 2.5m 짜리가 5m 로 나간다(2026-09-09 엑사에서 23건).
+    src = own_name or ""
+    words = []
+    for m_ in _TOKEN_RE.finditer(src):
+        w = m_.group(0)
+        if len(w) < 2 or w.upper() in have:
+            continue
+        if m_.start() > 0 and src[m_.start() - 1] == ".":
+            continue                    # '2.5m' 의 '5m'
+        if any(w in mm and w != mm for mm in model):
+            continue
+        words.append(w)
+    words = model + [w for w in words if w not in model]
     words = qty + [w for w in words if w not in qty]
     spec, plain = [], []
     for w in words:
@@ -818,6 +994,16 @@ def save_title(session, no, title: str, picked_keywords: list,
     if "loginForm" in r.text:
         raise RuntimeError("세션 만료")
     got = _input_val(r.text, "finalProductNameInput")
+    if not got.strip():
+        # 저장 응답이 늘 이 칸을 채워 돌려주지는 않는다(화면에서는 JS 가
+        # 채운다). 비어 오면 attr 팝업에서 되읽어 확인한다 - 안 그러면
+        # 실제로 저장된 것을 실패로 보고한다(2026-09-08 LCP_LHA_B915859).
+        try:
+            from . import attr_detail
+            got = (attr_detail.fetch_detail(session, no).get("title1")
+                   or "").strip()
+        except Exception:
+            pass
     return {"ok": got.strip() == title.strip(), "saved": got, "sent": title}
 
 def build_and_check(session, page: dict, own_name: str, *, tries: int = 4,

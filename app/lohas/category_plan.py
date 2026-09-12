@@ -30,18 +30,29 @@ TIER_NOTE = {
 }
 
 
-def pending(db, folder_name: str = None, only: str = "") -> dict:
-    """카테고리 미저장 L코드를 LCP 단위로 묶는다."""
-    sql = ("select lcp_code, l_code, product_no, etc_category "
-           "from lcode_attr where next_step='카테고리'")
+def pending(db, folder_name: str = None, only: str = "",
+            todo_only: bool = False) -> dict:
+    """
+    카테고리 미저장 L코드를 LCP 단위로 묶는다.
+
+    todo_only=True 면 **상품정보가 '미작업' 인 것만** 남긴다. 대표이미지
+    상태는 가리지 않는다 - 카테고리는 이미지 작업과 상관없는 선행 단계다
+    (2026-09-09 사용자 지시).
+    """
+    sql = ("select a.lcp_code, a.l_code, a.product_no, a.etc_category "
+           "from lcode_attr a")
+    if todo_only:
+        sql += (" join lcp_lcode l on l.product_no = a.product_no"
+                " and l.info_status = '미작업'")
+    sql += " where a.next_step='카테고리'"
     args = []
     if folder_name:
-        sql += " and folder_name=?"
+        sql += " and a.folder_name=?"
         args.append(folder_name)
     if only:
-        sql += " and lcp_code=?"
+        sql += " and a.lcp_code=?"
         args.append(only)
-    sql += " order by lcp_code, l_code"
+    sql += " order by a.lcp_code, a.l_code"
     groups = {}
     with db.sqlite_conn() as c:
         for r in c.execute(sql, args):
@@ -93,12 +104,13 @@ def decide(cands: list, sib: dict) -> dict:
 
 
 def build(session, db, folder_name: str = None, only: str = "",
-          tiers=(), log=print, progress=None, should_stop=None) -> list:
+          tiers=(), log=print, progress=None, should_stop=None,
+          todo_only: bool = False) -> list:
     """
     검토·저장 계획을 만든다. 후보 조회는 읽기 전용이라 안전하다.
     tiers 를 주면 그 등급만 남긴다.
     """
-    groups = pending(db, folder_name, only)
+    groups = pending(db, folder_name, only, todo_only=todo_only)
     sibs = siblings(db)
     names = list(groups)
     out = []

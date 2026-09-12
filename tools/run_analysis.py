@@ -2,7 +2,11 @@
 import io, sys, traceback
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# line_buffering 을 켜야 백그라운드로 돌릴 때 진행 상황이 보인다.
+# 안 켜면 `python -u` 를 줘도 이 래퍼가 다시 버퍼링해 끝날 때까지 아무것도
+# 안 나온다 (2026-09-08).
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                              errors="replace", line_buffering=True)
 
 from app import config, db
 from app.lohas.http_client import LohasHttp
@@ -31,6 +35,7 @@ def main():
 
     st = run_all_analysis(
         client, folder, done,
+        target_only="--target-only" in sys.argv,
         batch_size=config.ANALYSIS_BATCH,
         poll_interval=config.ANALYSIS_POLL,
         batch_timeout=config.ANALYSIS_TIMEOUT,
