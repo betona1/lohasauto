@@ -96,11 +96,22 @@ class LohasHttp:
             raise SessionExpired("세션이 만료되었습니다.")
         return html
 
+    # 세션이 끊기면 **두 가지 모양**으로 온다. 로그인 폼을 그리거나,
+    # 아무 내용 없이 `/member` 로 보내버린다. 뒤엣것을 못 잡아서
+    # '로그인됨' 으로 착각하고 **빈 응답을 정상 데이터로 읽어 DB 에 썼다**
+    # (2026-09-15: 158건이 '분석 안 됨' 으로 잘못 기록됐다).
+    @staticmethod
+    def looks_logged_out(html: str) -> bool:
+        h = (html or "")[:400]
+        return ("loginForm" in h
+                or "location.href='/member'" in h.replace('"', "'")
+                or len(h.strip()) < 120 and "/member" in h)
+
     def is_logged_in(self) -> bool:
         try:
             r = self.session.get(C.MANAGER_URL, timeout=30)
             r.encoding = "utf-8"
-            return "loginForm" not in r.text
+            return not self.looks_logged_out(r.text)
         except Exception:
             return False
 

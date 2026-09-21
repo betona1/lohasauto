@@ -21,6 +21,7 @@ from ..lohas.monitors import list_monitors
 from .monitor_worker import MonitorWorker
 from .category_page import CategoryPage
 from .category_review_page import CategoryReviewPage
+from .ad_board_page import AdBoardPage
 from .ad_page import AdPage
 from .todo_page import TodoPage
 from .category_fix_page import CategoryFixPage
@@ -52,9 +53,9 @@ STATUS_COLORS = {
 
 # 상단 탭에는 매일 쓰는 것만 둔다. 검토·수정용은 [검토중] 메뉴로 뺐다
 # (2026-09-05 사용자 요청). 인덱스는 stack 에 넣은 순서와 같아야 한다.
-NAV_TABS = ["대시보드", "상품정보", "미작업목록", "광고"]
+NAV_TABS = ["대시보드", "상품정보", "미작업목록", "광고상황판", "설정"]
 NAV_INDEX = {"대시보드": 0, "상품정보": 1, "미작업목록": 4,
-             "광고": 7}
+             "광고상황판": 8, "설정": 7}
 REVIEW_MENU = [("카테고리", 2), ("카테고리 검토", 3),
                ("카테고리 수정", 5), ("태그 검수", 6)]
 
@@ -279,7 +280,12 @@ class MainWindow(QMainWindow):
         # 광고 - 계정·캠페인 설정과 지출 집계(LCP별/날짜별).
         # 대시보드에는 올리지 않는다 (2026-09-11 사용자).
         self.page_ad = AdPage(self)
-        self.stack.addWidget(self.page_ad)          # 7 : 광고
+        self.stack.addWidget(self.page_ad)          # 7 : 설정(광고 계정·수집)
+
+        # 광고상황판 — 보는 전용 화면. 설정은 위 「설정」 탭에 있다
+        # (2026-09-16 사용자).
+        self.page_board = AdBoardPage(self)
+        self.stack.addWidget(self.page_board)       # 8 : 광고상황판
 
         root.addWidget(self._build_topbar())
 
@@ -326,6 +332,12 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self.to_tray)
 
         m = mb.addMenu("설정(&S)")
+        # 흩어져 있던 설정을 한 창에 모았다 (2026-09-16 사용자)
+        a = m.addAction("⚙ 환경설정...")
+        a.triggered.connect(self.on_settings)
+        a = m.addAction("⏰ 예약 작업...")
+        a.triggered.connect(self.on_schedule)
+        m.addSeparator()
         a = m.addAction("자동점검 폴더 선택...")
         a.triggered.connect(self.on_pick_monitor_folders)
         a = m.addAction("품절 이동 폴더 지정...")
@@ -721,6 +733,16 @@ class MainWindow(QMainWindow):
         self.btn_tag_all.clicked.connect(self.on_run_tag_all)
         top.addWidget(self.btn_tag_all)
 
+        self.btn_pipeline = QPushButton("🚀 전체 작업")
+        self.btn_pipeline.setMinimumHeight(34)
+        self.btn_pipeline.setStyleSheet("font-weight:bold; color:#b71c1c;")
+        self.btn_pipeline.setToolTip(
+            "마스터 폴더를 순서대로 끝까지 밉니다."
+            + chr(10) + "상태수집 → AI이미지 → 상품분석 → 카테고리 → 태그 → 상품명"
+            + chr(10) + "저장완료는 누르지 않습니다. 비트마인드는 기본 제외.")
+        self.btn_pipeline.clicked.connect(self.on_pipeline)
+        top.addWidget(self.btn_pipeline)
+
         self.btn_inspect = QPushButton("④ 전체 점검 (12칸)")
         self.btn_inspect.setMinimumHeight(34)
         self.btn_inspect.setToolTip(
@@ -780,6 +802,7 @@ class MainWindow(QMainWindow):
         self.card_ad_sales = StatCard("오늘 전환매출", "#2e7d32")
         self.card_ad_biz = StatCard("비즈머니 잔액", "#4527a0")
         # 광고 규모 — 등록만 많고 안 도는 것이 많아 **등록/실제**를 나눈다
+        self.card_ad_net = StatCard("실수입 (7일)", "#00838f")
         self.card_ad_lcp = StatCard("광고 LCP", "#00695c")
         self.card_ad_prod = StatCard("광고 상품(소재)", "#1565c0")
         self.card_ad_kw = StatCard("유입 검색어", "#6a1b9a")
@@ -790,6 +813,7 @@ class MainWindow(QMainWindow):
             self.card_img_done, self.card_img_work,
             self.card_info_todo, self.card_today,
             self.card_ad_today, self.card_ad_sales, self.card_ad_biz,
+            self.card_ad_net,
             self.card_ad_lcp, self.card_ad_prod, self.card_ad_kw,
         ]):
             grid.addWidget(c, i // 5, i % 5)
@@ -801,6 +825,20 @@ class MainWindow(QMainWindow):
         self.lbl_ad = QLabel("광고 : 아직 받아오지 않았습니다.")
         self.lbl_ad.setStyleSheet("color:#57606a;")
         adrow.addWidget(self.lbl_ad, 1)
+        self.btn_settings = QPushButton("⚙ 환경설정")
+        self.btn_settings.setToolTip(
+            "모니터·실행·광고·연결 설정을 한곳에서 바꿉니다."
+            + chr(10) + "모니터가 여러 대면 [모니터 보기] 로 번호를 확인하십시오.")
+        self.btn_settings.clicked.connect(self.on_settings)
+        adrow.addWidget(self.btn_settings)
+
+        self.btn_sched = QPushButton("⏰ 예약 작업")
+        self.btn_sched.setToolTip(
+            "매일 도는 예약을 보고 시각을 바꿉니다." + chr(10)
+            + "수정1.0 매일 20:00 · 광고수집 매일 03:00")
+        self.btn_sched.clicked.connect(self.on_schedule)
+        adrow.addWidget(self.btn_sched)
+
         self.btn_ad_stats = QPushButton("📈 광고비 통계")
         self.btn_ad_stats.setStyleSheet("font-weight:bold; color:#ad1457;")
         self.btn_ad_stats.setToolTip(
@@ -1338,6 +1376,40 @@ class MainWindow(QMainWindow):
         self.card_ad_biz.lbl_title.setText(
             f"비즈머니 잔액 — {main['label'] or main['customer_id']}"
             + ("  ·  ⚠ 소진" if bal <= 0 else ""))
+        # 실수입 — 매출이 아니라 남는 돈. 광고비가 이익을 넘으면 적자다
+        # (2026-09-16 사용자: 메인에도 기록해 달라).
+        try:
+            import datetime as _dt
+            from ..lohas import ad_profit
+            _e = _dt.date.today()
+            _s = _e - _dt.timedelta(days=6)
+            pr = ad_profit.summary(_s.isoformat(), _e.isoformat())
+            be = ad_profit.breakeven(_s.isoformat(), _e.isoformat())
+            tip = ad_profit.tip(_s.isoformat(), _e.isoformat())
+        except Exception:
+            pr, be, tip = {}, {}, ""
+        if pr:
+            net = int(pr.get("net") or 0)
+            self.card_ad_net.set_value(f"{net:,}원")
+            self.card_ad_net.lbl_value.setStyleSheet(
+                "border:none; color:"
+                + ("#2e7d32" if net > 0 else "#c62828"))
+            self.card_ad_net.lbl_title.setText(
+                f"실수입 7일 (광고상품)  ·  이익 "
+                f"{int(pr.get('profit') or 0):,}"
+                f" − 광고비 {int(pr.get('ad') or 0):,}")
+            if tip:
+                for w in (self.card_ad_net, self.card_ad_net.lbl_value,
+                          self.card_ad_net.lbl_title):
+                    w.setToolTip(tip)
+        if be.get("be_roas_paid") and tip:
+            self.card_ad_sales.lbl_title.setText(
+                self.card_ad_sales.lbl_title.text()
+                + f"  ·  손익분기 ROAS {be['be_roas_paid']:,}%")
+            for w in (self.card_ad_sales, self.card_ad_sales.lbl_value,
+                      self.card_ad_sales.lbl_title):
+                w.setToolTip(tip)
+
         # 광고 규모 카드 — `ad_creative.summary`
         try:
             from ..lohas import ad_creative
@@ -1361,6 +1433,32 @@ class MainWindow(QMainWindow):
             f" ({main['customer_id']})"
             + (f"   ·  마지막 수집 {t['upd']}" if t.get("upd")
                else "   ·  아직 지출을 받아오지 않았습니다"))
+
+    def on_pipeline(self):
+        """전체 작업 창. 창을 닫아도 계속 돈다."""
+        from .pipeline_dialog import PipelineDialog
+        if getattr(self, "_pipe_dlg", None) is None:
+            self._pipe_dlg = PipelineDialog(self)
+        self._pipe_dlg.show()
+        self._pipe_dlg.raise_()
+
+    def on_settings(self):
+        """환경설정 창 — 모니터·실행·광고·연결을 한곳에서."""
+        from .settings_dialog import SettingsDialog
+        if getattr(self, "_set_dlg", None) is None:
+            self._set_dlg = SettingsDialog(self)
+        self._set_dlg.show()
+        self._set_dlg.raise_()
+
+    def on_schedule(self):
+        """예약 작업 창 — 스케줄러에 걸린 것을 보고 시각을 바꾼다."""
+        from .schedule_dialog import ScheduleDialog
+        if getattr(self, "_sched_dlg", None) is None:
+            self._sched_dlg = ScheduleDialog(self)
+        else:
+            self._sched_dlg.reload()
+        self._sched_dlg.show()
+        self._sched_dlg.raise_()
 
     def on_ad_stats(self):
         """광고 성과 보고서 창. 한 번 만들고 다시 쓴다."""

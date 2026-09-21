@@ -12,7 +12,7 @@
 
 표기 이름은 사람이 바꿀 수 있다 — 사이트가 계정 이름을 안 주기 때문이다.
 """
-from .. import db
+from .. import config, db
 from . import searchad as sa
 
 _DDL = [
@@ -66,6 +66,16 @@ def ddl(c):
     # 비트테크노-1 은 9월 10일부터 집행).
     if "start_date" not in cols:
         c.execute("ALTER TABLE ad_account ADD COLUMN start_date TEXT")
+    # 입찰가 변경 이력 — 현재 값만 덮어쓰면 **언제 얼마로 바꿨는지** 알 수
+    # 없다. 수집할 때마다 전과 다르면 한 줄 남긴다(2026-09-16 사용자).
+    c.execute("""CREATE TABLE IF NOT EXISTS ad_bid_history (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id TEXT, adgroup_id TEXT, lcp_code TEXT, name TEXT,
+        old_bid     INTEGER, new_bid INTEGER,
+        changed_at  TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_bidh_at"
+              " ON ad_bid_history(changed_at)")
 
 
 def collect(log=print) -> dict:
@@ -79,6 +89,13 @@ def collect(log=print) -> dict:
     out = {"accounts": 0, "campaigns": 0, "groups": 0, "fail": []}
     with db.sqlite_conn() as c:
         ddl(c)
+        # **이름은 `.env` 가 주인이다.** INSERT 할 때만 넣으면 나중에
+        # NAVER_AD_NAME_n 을 고쳐도 표에는 옛 이름이 남는다 — 4464788 이
+        # '비트테크5' 로 바뀐 뒤에도 '미확인-4464788' 로 떴다(2026-09-16).
+        for a in config.naver_ad_accounts():
+            c.execute("UPDATE ad_account SET label=? WHERE customer_id=?"
+                      " AND COALESCE(label,'')<>?",
+                      (a["label"], str(a["customer"]), a["label"]))
     for cu in sa.customers():
         camps = sa.campaigns(cu)
         biz = sa.bizmoney(cu)
@@ -115,6 +132,23 @@ def collect(log=print) -> dict:
                     (str(cu), x["nccCampaignId"], x.get("name"),
                      x.get("campaignTp"), x.get("status"),
                      n_by_camp.get(x["nccCampaignId"], 0), now))
+            # 바뀐 입찰가를 먼저 집어낸다 (덮어쓰기 전에 비교해야 한다)
+            before = {r["adgroup_id"]: int(r["bid"] or 0) for r in c.execute(
+                "SELECT adgroup_id, bid FROM ad_group WHERE customer_id=?",
+                (str(cu),))}
+            for g in grps:
+                gid = g["nccAdgroupId"]
+                new_bid = int(g.get("bidAmt") or 0)
+                old_bid = before.get(gid)
+                if old_bid is not None and old_bid != new_bid:
+                    c.execute(
+                        "INSERT INTO ad_bid_history (customer_id, adgroup_id,"
+                        " lcp_code, name, old_bid, new_bid, changed_at)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (str(cu), gid,
+                         (g.get("name") or "") if (g.get("name") or "")
+                         .startswith("LCP_") else "",
+                         g.get("name") or "", old_bid, new_bid, now))
             for g in grps:
                 nm = (g.get("name") or "").strip()
                 c.execute(
@@ -186,6 +220,54 @@ def set_main(customer: str):
         c.execute("UPDATE ad_account SET is_main=0")
         c.execute("UPDATE ad_account SET is_main=1, enabled=1"
                   " WHERE customer_id=?", (str(customer),))
+
+
+def bid_history(customer: str = "", limit: int = 300) -> list:
+    """입찰가가 바뀐 기록. 수집할 때 전 값과 다르면 남는다."""
+    sql = "SELECT * FROM ad_bid_history"
+    a = []
+    if customer:
+        sql += " WHERE customer_id=?"
+        a.append(str(customer))
+    sql += " ORDER BY changed_at DESC, id DESC LIMIT ?"
+    a.append(limit)
+    with db.sqlite_conn() as c:
+        ddl(c)
+        return [dict(r) for r in c.execute(sql, a)]
+
+
+def bid_changes(customer: str = "", limit: int = 200) -> list:
+    """
+    **입찰가 변경을 한 줄로 묶는다.**
+
+    740개 그룹을 한꺼번에 200원 → 150원 으로 내리면 낱건으로는 740줄이
+    된다. 사람이 보기엔 `2026-09-18 11:18  200원 → 150원  740개 그룹`
+    한 줄이면 충분하다(2026-09-18 사용자).
+
+    같은 시각·같은 값 변화를 한 줄로 모으고, 어떤 LCP 들이었는지는
+    `sample` 에 몇 개만 붙인다.
+    """
+    sql = ("SELECT changed_at, customer_id, old_bid, new_bid, COUNT(*) n,"
+           " GROUP_CONCAT(name) names FROM ad_bid_history")
+    a = []
+    if customer:
+        sql += " WHERE customer_id=?"
+        a.append(str(customer))
+    sql += (" GROUP BY substr(changed_at,1,16), customer_id, old_bid, new_bid"
+            " ORDER BY changed_at DESC LIMIT ?")
+    a.append(limit)
+    with db.sqlite_conn() as c:
+        ddl(c)
+        lab = {r["customer_id"]: r["label"] for r in
+               c.execute("SELECT customer_id, label FROM ad_account")}
+        out = []
+        for r in c.execute(sql, a):
+            d = dict(r)
+            nm = [x for x in (d.pop("names") or "").split(",") if x][:3]
+            d["label"] = lab.get(d["customer_id"]) or d["customer_id"]
+            d["sample"] = "  ".join(nm) + (" …" if d["n"] > len(nm) else "")
+            out.append(d)
+        return out
 
 
 def set_start(customer: str, day: str):

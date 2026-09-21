@@ -145,6 +145,48 @@ def window_geometry(index: int, margin: int = 0):
     )
 
 
+def place_window(win, index: int) -> str:
+    """
+    Qt 창을 그 모니터 가운데로 옮긴다. 반환: 사람이 읽는 결과 한 줄.
+
+    **`show()` 전에 한 번 옮기는 것만으로는 부족하다.** 윈도우는 창을
+    띄우면서 마지막 위치나 커서가 있는 화면으로 되돌리는 수가 있어서,
+    띄운 뒤에 한 번 더 옮겨야 한다(2026-09-16: 4번으로 저장했는데 다른
+    화면에 떴다).
+
+    창이 그 모니터보다 크면 작업영역에 맞춰 줄인다 — 안 그러면 가운데로
+    옮겨도 절반이 옆 화면으로 삐져 나간다.
+    """
+    m = get_monitor(index)
+    if not m:
+        mm = [x for x in list_monitors() if x["primary"]]
+        m = mm[0] if mm else None
+    if not m:
+        return "모니터를 찾지 못해 그대로 둡니다"
+    w = min(win.width(), m["work_width"])
+    h = min(win.height(), m["work_height"])
+    if (w, h) != (win.width(), win.height()):
+        win.resize(w, h)
+    x = m["work_x"] + max((m["work_width"] - w) // 2, 0)
+    y = m["work_y"] + max((m["work_height"] - h) // 2, 0)
+    win.move(x, y)
+    return f"{m['label']} 에 배치 ({x}, {y}) {w}x{h}"
+
+
+def monitor_of(win):
+    """그 창이 지금 어느 모니터에 있나. 1-based, 못 찾으면 0."""
+    try:
+        c = win.frameGeometry().center()
+        cx, cy = c.x(), c.y()
+    except Exception:
+        return 0
+    for m in list_monitors():
+        if (m["x"] <= cx < m["x"] + m["width"]
+                and m["y"] <= cy < m["y"] + m["height"]):
+            return m["index"]
+    return 0
+
+
 def describe_all() -> str:
     mons = list_monitors()
     if not mons:

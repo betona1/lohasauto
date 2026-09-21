@@ -27,7 +27,8 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
 
 from app import db                                              # noqa: E402
 from app.lohas import (ad_account, ad_creative, ad_detail,       # noqa: E402
-                       ad_sales, ad_spend, commerce, searchad as sa)
+                       ad_profit, ad_sales, ad_spend, commerce,
+                       searchad as sa)
 
 KEY = "ad_daily_last"
 MAX_BACKFILL = 14          # 너무 옛날까지 거슬러 올라가지 않는다
@@ -156,6 +157,22 @@ def main():
                 f"({int(r['orders'] or 0)}건)")
     except Exception:
         pass
+
+    # 5-3) **원가·정산** — 실수입을 세려면 이게 있어야 한다. 이게 빠져
+    #      있어서 화면의 「주문·원가 받기」 를 누른 날까지만 이익이 쌓였다
+    #      (2026-09-16 실측: ad_spend 는 9/16, order_profit 은 9/15).
+    try:
+        r = ad_profit.collect(days=max(args.spend_days, 30),
+                              log=lambda *_: None)
+        log(f"이익 — 정산 {r['settle']:,}원 · 원가 {r['cost']:,}원 · "
+            f"이익 {r['profit']:,}원 (광고상품 {r['profit_ad']:,}원)")
+        for x in ad_profit.split(
+                (datetime.date.today()
+                 - datetime.timedelta(days=6)).isoformat(),
+                datetime.date.today().isoformat()):
+            log(f"    {x['kind']:14} 이익 {int(x['profit'] or 0):>9,}원")
+    except Exception as e:
+        log(f"이익 실패: {str(e)[:90]}")
 
     # 6) 놓친 검색어 요약 (태그 작업에 쓸 거리)
     try:

@@ -22,21 +22,17 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QTabBar, QTableWidget, QTableWidgetItem,
                                QTabWidget, QVBoxLayout, QWidget)
 
-from ..lohas import ad_account, ad_sales, ad_stats
+from ..lohas import ad_account, ad_sales, ad_schedule, ad_stats
+from .numitem import make_item
 
 NL = chr(10)
 PERIODS = [7, 14, 21, 30]
 PIE = ["#1565c0", "#ef6c00", "#2e7d32", "#6a1b9a", "#c62828", "#00838f"]
 
 
-def _it(v, right=False, color="") -> QTableWidgetItem:
-    it = QTableWidgetItem(str(v))
-    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-    if right:
-        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    if color:
-        it.setForeground(QColor(color))
-    return it
+def _it(v, right=False, color="", bold=False, num=None) -> QTableWidgetItem:
+    """정렬은 숫자로 한다 — `numitem` 참고."""
+    return make_item(v, right, color, bold, num)
 
 
 def _roas_color(r: int) -> str:
@@ -122,6 +118,8 @@ class AdReportDialog(QDialog):
         self.tabs.addTab(self._tab_trend(), "추이")
         self.tabs.addTab(self._tab_media(), "매체별")
         self.tabs.addTab(self._tab_top(), "TOP 10")
+        self.tabs.addTab(self._tab_hour(), "시간대")
+        self.tabs.addTab(self._tab_sched(), "⏱ 광고시간대")
         self.tabs.addTab(self._tab_lcp(), "LCP별 매출·ROAS")
         v.addWidget(self.tabs, 1)
 
@@ -252,6 +250,241 @@ class AdReportDialog(QDialog):
         lay.addWidget(self.t_top, 2)
         return w
 
+    def _tab_hour(self):
+        """
+        **시간대별 광고비.** 0~23시를 늘 다 그린다 — 돈이 안 나간 시간도
+        비어 있는 채로 보여야 언제 비는지 알 수 있다(2026-09-12 사용자).
+
+        대용량 보고서의 8열이 시간대다. 처음엔 9열(지역)을 시간으로 읽어
+        `99시` 가 나왔었다.
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.lbl_hour = QLabel("")
+        self.lbl_hour.setWordWrap(True)
+        self.lbl_hour.setStyleSheet(
+            "font-weight:bold; color:#4527a0; background:#ede7f6;"
+            " border-radius:6px; padding:8px;")
+        lay.addWidget(self.lbl_hour)
+        self.ch_hour = QChart()
+        self.ch_hour.legend().setAlignment(Qt.AlignBottom)
+        vw = QChartView(self.ch_hour)
+        vw.setRenderHint(QPainter.Antialiasing)
+        lay.addWidget(vw, 3)
+        self.t_hour = QTableWidget(0, 9)
+        self.t_hour.setHorizontalHeaderLabels(
+            ["시간", "노출시간", "광고비", "비중", "클릭", "노출", "CPC",
+             "주문", "실매출"])
+        self.t_hour.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.t_hour.verticalHeader().setVisible(False)
+        self.t_hour.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.Stretch)
+        lay.addWidget(self.t_hour, 2)
+        return w
+
+    def _fill_hour(self):
+        rows = {r["k"]: r for r in
+                ad_stats.by_dim("hour", self.days, self.cu, limit=24)}
+        data = []
+        for h in range(24):
+            r = rows.get(f"{h:02d}", {})
+            data.append({"h": h, "cost": int(r.get("cost") or 0),
+                         "clk": int(r.get("clk") or 0),
+                         "imp": int(r.get("imp") or 0)})
+        self._rows_hour = data
+        tot = sum(d["cost"] for d in data) or 1
+        ch = self.ch_hour
+        ch.removeAllSeries()
+        for ax in list(ch.axes()):
+            ch.removeAxis(ax)
+        bs = QBarSet("광고비")
+        bs.setColor(QColor("#4527a0"))
+        ln = QLineSeries()
+        ln.setName("클릭")
+        ln.setColor(QColor("#ef6c00"))
+        for i, d in enumerate(data):
+            bs.append(d["cost"])
+            ln.append(i, d["clk"])
+        ser = QBarSeries()
+        ser.append(bs)
+        ch.addSeries(ser)
+        ch.addSeries(ln)
+        ax = QBarCategoryAxis()
+        ax.append([f"{d['h']:02d}" for d in data])
+        ch.addAxis(ax, Qt.AlignBottom)
+        ser.attachAxis(ax)
+        ay = QValueAxis()
+        ay.setLabelFormat("%d")
+        ay.setTitleText("광고비(원)")
+        ay.setRange(0, max(1, max(d["cost"] for d in data)) * 1.2)
+        ch.addAxis(ay, Qt.AlignLeft)
+        ser.attachAxis(ay)
+        a2 = QValueAxis()
+        a2.setLabelFormat("%d")
+        a2.setTitleText("클릭")
+        a2.setRange(0, max(1, max(d["clk"] for d in data)) * 1.4)
+        ch.addAxis(a2, Qt.AlignRight)
+        ln.attachAxis(a2)
+        ax2 = QValueAxis()
+        ax2.setRange(-0.5, 23.5)
+        ax2.setVisible(False)
+        ch.addAxis(ax2, Qt.AlignBottom)
+        ln.attachAxis(ax2)
+        sale_h2 = {r["hour"]: int(r["amount"] or 0)
+                   for r in ad_sales.by_hour(self.days)}
+        ln2 = QLineSeries()
+        ln2.setName("실매출")
+        ln2.setColor(QColor("#2e7d32"))
+        for i, d in enumerate(data):
+            ln2.append(i, sale_h2.get(f"{d['h']:02d}", 0))
+        ch.addSeries(ln2)
+        a3 = QValueAxis()
+        a3.setLabelFormat("%d")
+        a3.setTitleText("실매출(원)")
+        a3.setRange(0, max(1, max(list(sale_h2.values()) or [1])) * 1.3)
+        ch.addAxis(a3, Qt.AlignRight)
+        ln2.attachAxis(a3)
+        ln2.attachAxis(ax2)
+        ch.setTitle(f"시간대별 광고비 + 주문 (최근 {self.days}일 · {tot:,}원)")
+
+        # 주문 시간대 + 지금 노출시간 설정을 같이 적는다
+        sale_h = {r["hour"]: r for r in ad_sales.by_hour(self.days)}
+        sc = ad_schedule.current(self.cu)
+        s_, e_ = sc.get("start_hour"), sc.get("end_hour")
+        self.t_hour.setRowCount(24)
+        for i, d in enumerate(data):
+            inside = True if s_ is None else (s_ <= d["h"] < e_)
+            v = sale_h.get(f"{d['h']:02d}", {})
+            self.t_hour.setItem(i, 0, _it(f"{d['h']:02d}시"))
+            self.t_hour.setItem(i, 1, _it("○" if inside else "—", True,
+                                          "" if inside else "#9e9e9e"))
+            self.t_hour.setItem(i, 2, _it(f"{d['cost']:,}원", True,
+                                          "" if inside else "#c62828"))
+            self.t_hour.setItem(i, 3, _it(f"{d['cost'] * 100 // tot}%", True))
+            self.t_hour.setItem(i, 4, _it(f"{d['clk']:,}", True))
+            self.t_hour.setItem(i, 5, _it(f"{d['imp']:,}", True))
+            self.t_hour.setItem(i, 6, _it(
+                f"{d['cost'] // d['clk'] if d['clk'] else 0:,}원", True))
+            self.t_hour.setItem(i, 7, _it(f"{int(v.get('orders') or 0):,}",
+                                          True))
+            self.t_hour.setItem(i, 8, _it(f"{int(v.get('amount') or 0):,}원",
+                                          True, "#2e7d32"))
+            d["orders"] = int(v.get("orders") or 0)
+            d["amount"] = int(v.get("amount") or 0)
+        night = sum(d["cost"] for d in data if d["h"] >= 19 or d["h"] < 2)
+        peak = max(data, key=lambda d: d["cost"])
+        self.lbl_hour.setText(
+            f"가장 많이 쓴 시간 {peak['h']:02d}시 {peak['cost']:,}원"
+            f"   ·   저녁 19~01시 {night:,}원 ({night * 100 // tot}%)"
+            f"   ·   합계 {tot:,}원"
+            + NL + "※ 대용량 보고서 기준이라 **어제까지**입니다.")
+
+    def _tab_sched(self):
+        """
+        **광고 노출시간 설정과 실제 지출을 맞대본다.**
+
+        노출시간을 바꾸면 그날부터 곡선이 바뀐다. 기록이 없으면 나중에
+        "왜 줄었지?" 를 못 푼다. 설정 밖에서 나간 돈도 같이 본다 —
+        설정이 안 먹었는지 바로 드러난다(2026-09-16 사용자).
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("적용일"))
+        from PySide6.QtWidgets import QDateEdit, QSpinBox, QLineEdit
+        from PySide6.QtCore import QDate
+        self.sc_day = QDateEdit()
+        self.sc_day.setCalendarPopup(True)
+        self.sc_day.setDisplayFormat("yyyy-MM-dd")
+        self.sc_day.setDate(QDate.currentDate())
+        row.addWidget(self.sc_day)
+        row.addWidget(QLabel("시작"))
+        self.sc_s = QSpinBox()
+        self.sc_s.setRange(0, 23)
+        self.sc_s.setValue(8)
+        self.sc_s.setSuffix("시")
+        row.addWidget(self.sc_s)
+        row.addWidget(QLabel("끝"))
+        self.sc_e = QSpinBox()
+        self.sc_e.setRange(1, 24)
+        self.sc_e.setValue(22)
+        self.sc_e.setSuffix("시")
+        row.addWidget(self.sc_e)
+        self.sc_memo = QLineEdit()
+        self.sc_memo.setPlaceholderText("메모 (왜 바꿨는지)")
+        row.addWidget(self.sc_memo, 1)
+        b = QPushButton("기록 추가")
+        b.clicked.connect(self._add_sched)
+        row.addWidget(b)
+        lay.addLayout(row)
+
+        self.lbl_sched = QLabel("")
+        self.lbl_sched.setWordWrap(True)
+        self.lbl_sched.setStyleSheet(
+            "font-weight:bold; color:#4527a0; background:#ede7f6;"
+            " border-radius:6px; padding:8px;")
+        lay.addWidget(self.lbl_sched)
+
+        lay.addWidget(QLabel("변경 이력"))
+        self.t_sched = QTableWidget(0, 4)
+        self.t_sched.setHorizontalHeaderLabels(
+            ["적용일", "노출시간", "메모", "기록시각"])
+        self.t_sched.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.t_sched.verticalHeader().setVisible(False)
+        self.t_sched.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.Stretch)
+        self.t_sched.setMaximumHeight(150)
+        lay.addWidget(self.t_sched)
+
+        lay.addWidget(QLabel("설정 시간 안/밖 지출  —  밖에서 나가면 설정이"
+                             " 안 먹은 것입니다"))
+        self.t_out = QTableWidget(0, 5)
+        self.t_out.setHorizontalHeaderLabels(
+            ["날짜", "노출시간", "시간 안", "시간 밖", "밖에서 나간 시각"])
+        self.t_out.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.t_out.verticalHeader().setVisible(False)
+        self.t_out.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.Stretch)
+        lay.addWidget(self.t_out, 1)
+        return w
+
+    def _add_sched(self):
+        if not self.cu:
+            QMessageBox.warning(self, "광고시간대", "메인 계정을 정하십시오.")
+            return
+        ad_schedule.add(self.cu, self.sc_day.date().toString("yyyy-MM-dd"),
+                        self.sc_s.value(), self.sc_e.value(), "매일",
+                        self.sc_memo.text().strip())
+        self.sc_memo.clear()
+        self._fill_sched()
+
+    def _fill_sched(self):
+        hist = ad_schedule.history(self.cu, 50)
+        self.t_sched.setRowCount(len(hist))
+        for i, r in enumerate(hist):
+            self.t_sched.setItem(i, 0, _it(r["from_day"]))
+            self.t_sched.setItem(i, 1, _it(ad_schedule.label(r)))
+            self.t_sched.setItem(i, 2, _it(r.get("memo") or ""))
+            self.t_sched.setItem(i, 3, _it(r.get("created_at") or ""))
+        rows = ad_schedule.outside_spend(self.cu, self.days)
+        self.t_out.setRowCount(len(rows))
+        out_tot = 0
+        for i, r in enumerate(rows):
+            out_tot += r["out_cost"]
+            self.t_out.setItem(i, 0, _it(r["day"]))
+            self.t_out.setItem(i, 1, _it(r["sched"]))
+            self.t_out.setItem(i, 2, _it(f"{r['in_cost']:,}원", True))
+            self.t_out.setItem(i, 3, _it(f"{r['out_cost']:,}원", True,
+                                         "#c62828" if r["out_cost"] else ""))
+            self.t_out.setItem(i, 4, _it(r["out_hours"]))
+        cur = ad_schedule.current(self.cu)
+        self.lbl_sched.setText(
+            f"지금 설정 : {ad_schedule.label(cur)}"
+            + (f"   ·   {cur.get('from_day')} 부터" if cur else "")
+            + NL + f"최근 {self.days}일 중 설정 시간 밖 지출 {out_tot:,}원"
+            + ("  ← 설정 전 기간이 섞여 있으면 정상입니다" if out_tot else ""))
+
     def _tab_lcp(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -284,6 +517,8 @@ class AdReportDialog(QDialog):
         self._fill_trend()
         self._fill_media()
         self._fill_top()
+        self._fill_hour()
+        self._fill_sched()
         self._fill_lcp()
 
     def _fill_cards(self):
@@ -656,6 +891,15 @@ class AdReportDialog(QDialog):
         sheet("매체×날짜", ["매체", "합계"] + days_, rows_t,
               money=tuple(range(2, len(days_) + 3)),
               bold_rows=(4, 5, 6))
+
+        sheet("시간대", ["시간", "광고비", "비중(%)", "클릭", "노출", "CPC"],
+              [[f"{d['h']:02d}시", d["cost"],
+                d["cost"] * 100 // (sum(x["cost"] for x in self._rows_hour)
+                                    or 1),
+                d["clk"], d["imp"],
+                d["cost"] // d["clk"] if d["clk"] else 0]
+               for d in self._rows_hour],
+              money=(2, 4, 5, 6), pct=(3,))
 
         sheet("TOP10", ["순위", "상품명", "LCP", "광고비", "클릭", "실매출",
                         "주문", "ROAS(%)"],

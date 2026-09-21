@@ -56,6 +56,18 @@ def store_filter() -> str:
     return config._str("ORDER_STORE") or STORE
 
 
+def store_like() -> str:
+    """
+    **뒤에 와일드카드를 붙이지 않는다.** `LIKE '%비트마인드%'` 로 하면
+    `02비트마인드2` 까지 딸려 온다. 그건 커머스 API 가 보지 않는 **다른
+    가게**라 실수입이 엉뚱하게 잡힌다 — 9/15 실수입에 비트마인드2 주문
+    29,030원이 섞여 있었다(2026-09-16 실측).
+
+    앞의 번호(`02`)만 흘리고 이름은 끝을 맞춘다.
+    """
+    return "%" + store_filter()
+
+
 def _ddl(c):
     c.execute("""CREATE TABLE IF NOT EXISTS ad_sales (
         day        TEXT NOT NULL,
@@ -121,6 +133,65 @@ def kind_of(mgmt: str, is_ad: bool) -> str:
 
 
 KINDS = ("광고상품", "로하스-비광고", "W코드", "기타")
+
+
+def _ddl_item(c):
+    """**팔린 상품 하나하나.** LCP 별 합계만으로는 무엇이 팔렸는지 모른다."""
+    c.execute("""CREATE TABLE IF NOT EXISTS sales_item (
+        day          TEXT NOT NULL,
+        product_code TEXT NOT NULL,   -- 스마트스토어 상품번호
+        name         TEXT,
+        lcp_code     TEXT,
+        l_code       TEXT,
+        kind         TEXT,            -- 광고상품 / 로하스-비광고 / W코드
+        orders       INTEGER DEFAULT 0,
+        qty          INTEGER DEFAULT 0,
+        amount       INTEGER DEFAULT 0,
+        PRIMARY KEY (day, product_code)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sitem_day ON sales_item(day)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sitem_lcp"
+              " ON sales_item(lcp_code)")
+
+
+def items(since: str, until: str, kind: str = "", limit: int = 500) -> list:
+    """팔린 상품 목록. 기간은 날짜 문자열(YYYY-MM-DD)."""
+    sql = ("SELECT product_code, MAX(name) name, MAX(lcp_code) lcp_code,"
+           " MAX(l_code) l_code, MAX(kind) kind, SUM(orders) orders,"
+           " SUM(qty) qty, SUM(amount) amount FROM sales_item"
+           " WHERE day>=? AND day<=?")
+    a = [since, until]
+    if kind:
+        sql += " AND kind=?"
+        a.append(kind)
+    sql += " GROUP BY product_code ORDER BY amount DESC LIMIT ?"
+    a.append(limit)
+    with db.sqlite_conn() as c:
+        _ddl_item(c)
+        return [dict(r) for r in c.execute(sql, a)]
+
+
+def _ddl_hour(c):
+    c.execute("""CREATE TABLE IF NOT EXISTS sales_hour (
+        day    TEXT NOT NULL,
+        hour   TEXT NOT NULL,
+        orders INTEGER DEFAULT 0,
+        qty    INTEGER DEFAULT 0,
+        amount INTEGER DEFAULT 0,
+        PRIMARY KEY (day, hour)
+    )""")
+
+
+def by_hour(days: int = 7) -> list:
+    """주문 시간대별. 광고 시간대와 맞대보는 용도."""
+    since = (datetime.date.today()
+             - datetime.timedelta(days=days - 1)).isoformat()
+    with db.sqlite_conn() as c:
+        _ddl_hour(c)
+        return [dict(r) for r in c.execute(
+            "SELECT hour, SUM(orders) orders, SUM(qty) qty,"
+            " SUM(amount) amount FROM sales_hour WHERE day>=?"
+            " GROUP BY hour ORDER BY hour", (since,))]
 
 
 def _ddl_split(c):
@@ -206,6 +277,35 @@ def collect_commerce(days: int = 14, log=print) -> dict:
             a[0] += v["orders"]
             a[1] += v["qty"]
             a[2] += v["amount"]
+    # 팔린 상품도 하나하나 쌓는다
+    with db.sqlite_conn() as c2:
+        _ddl_item(c2)
+        c2.execute("DELETE FROM sales_item WHERE day>=?",
+                   (since.isoformat(),))
+        rows_i = []
+        for d, r in per_day.items():
+            for code, v in (r.get("by_product") or {}).items():
+                key = cmap.get(code)
+                rows_i.append((d, code, v.get("name") or "",
+                               key[0] if key else "", key[1] if key else "",
+                               kind_of(mg.get(code, ""), code in cmap),
+                               v["orders"], v["qty"], v["amount"]))
+        c2.executemany(
+            "INSERT OR REPLACE INTO sales_item (day, product_code, name,"
+            " lcp_code, l_code, kind, orders, qty, amount)"
+            " VALUES (?,?,?,?,?,?,?,?,?)", rows_i)
+
+    # 주문 시간대도 같이 쌓는다
+    with db.sqlite_conn() as c2:
+        _ddl_hour(c2)
+        c2.execute("DELETE FROM sales_hour WHERE day>=?",
+                   (since.isoformat(),))
+        c2.executemany(
+            "INSERT OR REPLACE INTO sales_hour (day, hour, orders, qty,"
+            " amount) VALUES (?,?,?,?,?)",
+            [(d, h, v["orders"], v["qty"], v["amount"])
+             for d, r in per_day.items()
+             for h, v in (r.get("by_hour") or {}).items()])
     with db.sqlite_conn() as c2:
         _ddl_split(c2)
         c2.execute("DELETE FROM sales_split WHERE day>=?",
@@ -253,7 +353,7 @@ def collect_orderdb(days: int = 14, log=print) -> dict:
     try:
         with cn.cursor() as c:
             c.execute(sql, [since, f"%{SITE}%",
-                            f"%{store_filter()}%", *DEAD])
+                            store_like(), *DEAD])
             rows = c.fetchall()
     finally:
         cn.close()

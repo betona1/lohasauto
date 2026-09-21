@@ -251,13 +251,24 @@ def sales_range(since, until=None, log=print) -> dict:
         if not d or d < str(since) or d > str(until):
             continue
         b = out.setdefault(d, {"day": d, "orders": 0, "qty": 0, "amount": 0,
-                               "by_product": {}})
+                               "by_product": {}, "by_hour": {}})
+        # **주문 시각.** 광고 시간대와 맞대보려면 시(hour)가 필요하다
+        # (2026-09-16 사용자). orderDate 는 '...T14:23:05.123+09:00' 꼴이다.
+        od = (r.get("order") or {}).get("orderDate") or ""
+        hh = od[11:13] if len(od) > 12 else ""
+        if hh.isdigit():
+            hb = b["by_hour"].setdefault(hh, {"orders": 0, "qty": 0,
+                                              "amount": 0})
         code = str(po.get("productId") or "")
         q = int(po.get("quantity") or 0)
         a = int(po.get("totalPaymentAmount") or 0)
         b["orders"] += 1
         b["qty"] += q
         b["amount"] += a
+        if hh.isdigit():
+            hb["orders"] += 1
+            hb["qty"] += q
+            hb["amount"] += a
         p2 = b["by_product"].setdefault(
             code, {"orders": 0, "qty": 0, "amount": 0,
                    "name": po.get("productName") or ""})

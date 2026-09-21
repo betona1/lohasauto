@@ -58,7 +58,11 @@ def main():
             log(f"      DB {st['rows']:,}행  {st.get('mirror', '')}")
 
     log("[2/3] 카테고리 후보 조회 · 등급 매기기")
-    plan = cp.build(s, db, folder, tiers=tiers, log=log, todo_only=True)
+    # **`lcp_lcode` 에 없는 L코드가 있다.** 점검(12칸)이 그 상품을 못 담으면
+    # info_status 가 비고, todo_only 가 통째로 걸러낸다 — 158건이 그렇게
+    # 영영 안 보였다(2026-09-15). `--any-status` 로 그 필터를 푼다.
+    todo = "--any-status" not in sys.argv
+    plan = cp.build(s, db, folder, tiers=tiers, log=log, todo_only=todo)
     plan = [p for p in plan if p.get("candidates")]
     by_tier = {}
     for p in plan:
